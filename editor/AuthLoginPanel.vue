@@ -1,0 +1,1529 @@
+<template>
+  <div>
+    <!--
+      What went wrong, above whichever screen is showing.
+
+      Above rather than beside the field it came from, because most of these are not about one field:
+      a refused password, an expired reset token, a provider that failed somewhere else entirely. And
+      here rather than in a toast at the top of the window, which is five seconds of small text a long
+      way from the form being read — a login that quietly does nothing is how a wrong password looks
+      when the only thing that said so has already gone.
+    -->
+    <w-banner v-if="state.errorMessage" class="auth-error" role="alert">
+      <template #avatar><w-icon name="mdi:alert" size="24px" /></template>
+      <div class="auth-error-message">{{ state.errorMessage }}</div>
+      <div class="auth-error-caption" v-if="state.errorCaption">{{ state.errorCaption }}</div>
+    </w-banner>
+    <!--
+      Nothing until the strategies are known.
+
+      Every screen below depends on them — which fields the form has, what the username is called,
+      whether there is a register link or a forgot-password one, which providers get a button. Drawn
+      before the answer arrives, the panel is a guess that then corrects itself, and the correction
+      moved the form ~34px up the page a beat after it was first painted: this column is vertically
+      centred, so anything added below the form shifts the form. A field that jumps out from under
+      the pointer is a field that cannot be clicked, which is what made focusing the email address
+      take two tries.
+    -->
+    <!-- -> Kept up while leaving for the provider too, so the form is not painted for the moment
+            before the browser navigates away -->
+    <div
+      v-if="!state.strategiesLoaded || state.isAutoLoginRedirecting"
+      class="flex justify-center py-8">
+      <w-spinner color="primary" size="lg" />
+    </div>
+    <!-- ----------------------------------------------------- -->
+    <!-- LOGIN SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `login`">
+      <p class="auth-subtitle" v-if="formStrategies.length === 1">
+        {{ t('auth.enterCredentials') }}
+      </p>
+      <p
+        class="auth-subtitle"
+        v-else-if="formStrategies.length === 0 && redirectStrategies.length > 0">
+        {{ t('auth.selectAuthProvider') }}
+      </p>
+      <template v-else-if="formStrategies.length > 1">
+        <p class="auth-subtitle">{{ t('auth.selectAuthProvider') }}</p>
+        <div class="auth-strategies mb-4">
+          <w-btn
+            v-for="str of formStrategies"
+            :label="str.activeStrategy.displayName"
+            :icon="`img:` + str.activeStrategy.strategy.icon"
+            push
+            no-caps
+            :color="
+              str.id === state.selectedStrategyId
+                ? `primary`
+                : dark.isActive
+                  ? `blue-grey-9`
+                  : `grey-1`
+            "
+            :text-color="
+              str.id === state.selectedStrategyId || dark.isActive ? `white` : `blue-grey-9`
+            "
+            @click="selectFormStrategy(str.id)" />
+        </div>
+      </template>
+      <!-- -> Only for a strategy that takes a password here: with local authentication off and nothing
+              else of that kind enabled, a username and password would have nowhere to go -->
+      <w-form v-if="formStrategies.length > 0" ref="loginForm" @submit="login">
+        <!--
+          `username`, whatever the strategy calls this field. It is the account identifier of a login
+          form, which is what that token means — an address typed here is not an email address being
+          collected, it is the name of an account, and `email` is the token for the former. What reads
+          the difference is the browser's password manager and every extension standing in for one:
+          `username` beside `current-password` is the pair they look for, and a form they classify
+          some other way gets treated some other way.
+
+          The LABEL still follows the strategy, since that is what the reader is being asked for.
+        -->
+        <w-input
+          ref="loginEmailIpt"
+          v-model="state.username"
+          autofocus
+          outlined
+          :label="
+            t(`auth.fields.` + (selectedStrategy.activeStrategy?.strategy?.usernameType ?? `email`))
+          "
+          :rules="
+            selectedStrategy.activeStrategy?.strategy?.usernameType === `username`
+              ? loginUsernameValidation
+              : userEmailValidation
+          "
+          lazy-rules="ondemand"
+          hide-bottom-space
+          autocomplete="username">
+          <template #prepend><w-icon name="la:user" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          v-model="state.password"
+          outlined
+          :label="t(`auth.fields.password`)"
+          :rules="loginPasswordValidation"
+          lazy-rules="ondemand"
+          hide-bottom-space
+          type="password"
+          autocomplete="current-password">
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-btn
+          class="w-full mt-2"
+          type="submit"
+          push
+          color="primary"
+          :label="t(`auth.actions.login`)"
+          no-caps
+          icon="la:sign-in-alt" />
+      </w-form>
+      <!--
+        Straight into the browser's passkey prompt: a passkey is a discoverable credential, so the
+        authenticator knows which accounts it holds for this site and asking for an email address first
+        would only be a step in the way.
+      -->
+      <template v-if="canUsePasskeys">
+        <w-separator v-if="formStrategies.length > 0" class="my-4" />
+        <w-btn
+          class="acrylic-btn w-full"
+          flat
+          color="primary"
+          :text-color="acrylicBtnTextColor"
+          :label="t(`auth.passkeys.signin`)"
+          no-caps
+          icon="la:key"
+          @click="loginWithPasskey" />
+      </template>
+      <!--
+        The providers that sign a user in elsewhere. A link rather than a form submit, because what
+        follows is a page at the provider and not an answer to a request: pressing it hands the browser
+        over, and it comes back at the callback route with a session already established.
+      -->
+      <template v-if="redirectStrategies.length > 0">
+        <w-separator v-if="formStrategies.length > 0 || canUsePasskeys" class="my-4" />
+        <w-btn
+          class="acrylic-btn w-full mb-2"
+          v-for="str of redirectStrategies"
+          :key="str.id"
+          flat
+          color="primary"
+          :text-color="acrylicBtnTextColor"
+          :label="str.activeStrategy.displayName"
+          no-caps
+          :icon="`img:` + str.activeStrategy.strategy.icon"
+          :href="authorizeUrl(str)"
+          type="a" />
+      </template>
+      <template v-if="selectedStrategy.activeStrategy?.strategy?.key === `local`">
+        <w-separator class="my-4" />
+        <w-btn
+          class="acrylic-btn w-full mb-2"
+          v-if="selectedStrategy.activeStrategy.registration"
+          flat
+          color="primary"
+          :text-color="acrylicBtnTextColor"
+          :label="t(`auth.switchToRegister.link`)"
+          no-caps
+          icon="la:user-plus"
+          @click="switchTo(`register`)" />
+        <!-- -> Off where the strategy says so: a wiki that hands passwords out rather than letting
+                them be chosen has nothing for this to do -->
+        <w-btn
+          class="acrylic-btn w-full"
+          v-if="selectedStrategy.activeStrategy.allowForgotPassword"
+          flat
+          color="primary"
+          :text-color="acrylicBtnTextColor"
+          :label="t(`auth.forgotPasswordLink`)"
+          no-caps
+          icon="la:life-ring"
+          @click="switchTo(`forgot`)" />
+      </template>
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- FORGOT PASSWORD SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `forgot`">
+      <p class="auth-subtitle">{{ t('auth.forgotPasswordSubtitle') }}</p>
+      <w-form ref="forgotForm" @submit="forgotPassword">
+        <w-input
+          ref="forgotEmailIpt"
+          v-model="state.username"
+          outlined
+          :rules="userEmailValidation"
+          lazy-rules="ondemand"
+          hide-bottom-space
+          :label="t(`auth.fields.email`)"
+          autocomplete="email">
+          <template #prepend><w-icon name="la:envelope" /></template>
+        </w-input>
+        <w-btn
+          class="w-full mt-2"
+          type="submit"
+          push
+          color="primary"
+          :label="t(`auth.sendResetPassword`)"
+          no-caps
+          icon="la:life-ring" />
+      </w-form>
+      <w-separator class="my-4" />
+      <w-btn
+        class="acrylic-btn w-full"
+        flat
+        color="primary"
+        :text-color="acrylicBtnTextColor"
+        :label="t(`auth.forgotPasswordCancel`)"
+        no-caps
+        icon="la:arrow-circle-left"
+        @click="switchTo(`login`)" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- CONFIRM EMAIL SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <!--
+      A button rather than something this screen does on arrival. The link that leads here is fetched
+      by the scanners some mail providers put in front of a mailbox — Outlook's Safe Links among them
+      — and anything that confirmed the address on load would be spent by the scanner, leaving the
+      reader with a link that has already been used.
+    -->
+    <template v-else-if="state.screen === `verifyEmail`">
+      <p class="auth-subtitle">{{ t('auth.verifyEmail.instructions') }}</p>
+      <w-btn
+        class="w-full mt-2"
+        push
+        color="primary"
+        :label="t(`auth.verifyEmail.proceed`)"
+        no-caps
+        icon="la:check-circle"
+        @click="confirmEmail" />
+      <w-separator class="my-4" />
+      <w-btn
+        class="acrylic-btn w-full"
+        flat
+        color="primary"
+        :text-color="acrylicBtnTextColor"
+        :label="t(`auth.switchToLogin.link`)"
+        no-caps
+        icon="la:arrow-circle-left"
+        @click="cancelVerifyEmail" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- RESET PASSWORD SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `resetPwd`">
+      <p class="auth-subtitle">{{ t('auth.resetPwd.instructions') }}</p>
+      <w-form ref="resetPwdForm" @submit="resetPassword">
+        <w-input
+          v-model="state.newPassword"
+          autofocus
+          outlined
+          :label="t(`auth.changePwd.newPassword`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #append>
+            <w-badge
+              v-show="state.newPassword"
+              :color="passwordStrength.color"
+              :label="passwordStrength.label" />
+          </template>
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          v-model="state.newPasswordVerify"
+          outlined
+          :label="t(`auth.changePwd.newPasswordVerify`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordVerifyValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-btn
+          class="w-full mt-2"
+          type="submit"
+          push
+          color="primary"
+          :label="t(`auth.changePwd.proceed`)"
+          no-caps
+          icon="la:sync-alt" />
+      </w-form>
+      <w-separator class="my-4" />
+      <w-btn
+        class="acrylic-btn w-full"
+        flat
+        color="primary"
+        :text-color="acrylicBtnTextColor"
+        :label="t(`auth.switchToLogin.link`)"
+        no-caps
+        icon="la:arrow-circle-left"
+        @click="cancelReset" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- REGISTER SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `register`">
+      <p class="auth-subtitle">{{ t('auth.registerSubTitle') }}</p>
+      <w-form ref="registerForm" @submit="register">
+        <w-input
+          ref="registerNameIpt"
+          v-model="state.newName"
+          outlined
+          :rules="userNameValidation"
+          lazy-rules="ondemand"
+          hide-bottom-space
+          :label="t(`auth.fields.name`)"
+          autocomplete="name">
+          <template #prepend><w-icon name="la:user-circle" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          type="email"
+          v-model="state.newEmail"
+          outlined
+          :rules="userEmailValidation"
+          lazy-rules="ondemand"
+          hide-bottom-space
+          :label="t(`auth.fields.email`)"
+          autocomplete="email">
+          <template #prepend><w-icon name="la:envelope" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          v-model="state.newPassword"
+          outlined
+          :label="t(`auth.fields.password`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #append>
+            <w-badge
+              v-show="state.newPassword"
+              :color="passwordStrength.color"
+              :label="passwordStrength.label" />
+          </template>
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          v-model="state.newPasswordVerify"
+          outlined
+          :label="t(`auth.fields.verifyPassword`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordVerifyValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-btn
+          class="w-full mt-2"
+          type="submit"
+          push
+          color="primary"
+          :label="t(`auth.actions.register`)"
+          no-caps
+          icon="la:user-plus" />
+      </w-form>
+      <w-separator class="my-4" />
+      <w-btn
+        class="acrylic-btn w-full"
+        flat
+        color="primary"
+        :text-color="acrylicBtnTextColor"
+        :label="t(`auth.switchToLogin.link`)"
+        no-caps
+        icon="la:arrow-circle-left"
+        @click="switchTo(`login`)" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- CHANGE PASSWORD SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `changePwd`">
+      <p class="auth-subtitle" v-if="state.changePwdForced">
+        {{ t('auth.changePwd.instructions') }}
+      </p>
+      <w-form ref="changePwdForm" @submit="changePwd">
+        <w-input
+          v-if="!state.changePwdForced"
+          ref="changePwdCurrentIpt"
+          v-model="state.password"
+          outlined
+          type="password"
+          :rules="loginPasswordValidation"
+          lazy-rules="ondemand"
+          hide-bottom-space
+          :label="t(`auth.changePwd.currentPassword`)"
+          autocomplete="password">
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          ref="changePwdNewPwdIpt"
+          v-model="state.newPassword"
+          outlined
+          :label="t(`auth.changePwd.newPassword`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #append>
+            <w-badge
+              v-show="state.newPassword"
+              :color="passwordStrength.color"
+              :label="passwordStrength.label" />
+          </template>
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-input
+          class="mt-2"
+          v-model="state.newPasswordVerify"
+          outlined
+          :label="t(`auth.changePwd.newPasswordVerify`)"
+          type="password"
+          autocomplete="new-password"
+          :rules="userPasswordVerifyValidation"
+          hide-bottom-space
+          lazy-rules="ondemand">
+          <template #prepend><w-icon name="la:key" /></template>
+        </w-input>
+        <w-btn
+          class="w-full mt-2"
+          type="submit"
+          push
+          color="primary"
+          :label="t(`auth.changePwd.proceed`)"
+          no-caps
+          icon="la:sync-alt" />
+      </w-form>
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- TFA SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `tfa`">
+      <p class="auth-subtitle">{{ t('auth.tfa.subtitle') }}</p>
+      <v-otp-input
+        v-model:value="state.securityCode"
+        :num-inputs="6"
+        :should-auto-focus="true"
+        input-classes="otp-input"
+        input-type="number"
+        separator=""
+        @on-complete="verifyTFA" />
+      <w-btn
+        class="w-full mt-4"
+        push
+        color="primary"
+        :label="t(`auth.tfa.verifyToken`)"
+        no-caps
+        icon="la:sign-in-alt"
+        @click="verifyTFA" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- TFA SETUP SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <template v-else-if="state.screen === `tfasetup`">
+      <p class="auth-subtitle">{{ t('auth.tfaSetupTitle') }}</p>
+      <p class="auth-subtitle">{{ t('auth.tfaSetupInstrFirst') }}</p>
+      <div style="justify-content: center; display: flex">
+        <div v-html="state.tfaQRImage" style="width: 200px" />
+      </div>
+      <!--
+        The same secret in text, for an authenticator app that is not on the device showing this, or
+        a user who would rather type it than point a camera at the screen. Grouped in fours to be
+        readable; the copy button copies it without the spaces. Same block as `SetupTfaDialog`, which
+        is the other half of this — 2FA set up from the profile rather than forced at the login.
+      -->
+      <div class="mt-2 text-center text-caption text-grey">
+        {{ t('auth.tfaSetupInstrManual') }}
+      </div>
+      <div class="mt-1 flex items-center justify-center gap-2">
+        <!--
+          `text-caption`, a step down from the `text-body2` the same block uses in `SetupTfaDialog`:
+          the key is 32 characters and 7 spaces of monospace, and this panel is a 500px column with
+          4rem of padding either side -- at 14px it does not fit beside the copy button and wraps to
+          a second line, which for something being read a group at a time and typed into a phone is
+          worse than the smaller size.
+        -->
+        <code class="rounded bg-black/6 px-2 py-1 font-mono text-caption dark:bg-white/10">{{
+          groupedTfaSecret
+        }}</code>
+        <w-btn
+          class="acrylic-btn"
+          flat
+          dense
+          icon="la:copy"
+          :aria-label="t(`common.actions.copy`)"
+          color="primary"
+          :text-color="acrylicBtnTextColor"
+          @click="copyTfaSecret" />
+      </div>
+      <p class="auth-subtitle">{{ t('auth.tfaSetupInstrSecond') }}</p>
+      <v-otp-input
+        v-model:value="state.securityCode"
+        :num-inputs="6"
+        :should-auto-focus="true"
+        input-classes="otp-input"
+        input-type="number"
+        separator="" />
+      <w-btn
+        class="w-full mt-4"
+        push
+        color="primary"
+        :label="t(`auth.tfa.verifyToken`)"
+        no-caps
+        icon="la:sign-in-alt"
+        @click="finishSetupTFA" />
+    </template>
+    <!-- ----------------------------------------------------- -->
+    <!-- SUCCESS SCREEN -->
+    <!-- ----------------------------------------------------- -->
+    <!--
+      Where a flow that has nothing left to do ends. A mail sent, a password changed, an address
+      confirmed: that is the whole answer to what the reader just pressed, and said in a toast it is
+      four lines at the top of the window, gone in five seconds, nowhere near the form they were
+      looking at. Here it takes the panel over, and the way on is the link under it.
+    -->
+    <template v-else-if="state.screen === `success`">
+      <div class="auth-success" role="status">
+        <w-icon name="mdi:check-circle" color="positive" size="5rem" />
+        <h3 class="auth-success-message">{{ state.successMessage }}</h3>
+        <p class="auth-success-caption" v-if="state.successCaption">{{ state.successCaption }}</p>
+      </div>
+      <w-separator class="my-4" />
+      <w-btn
+        class="acrylic-btn w-full"
+        flat
+        color="primary"
+        :text-color="acrylicBtnTextColor"
+        :label="t(`auth.switchToLogin.link`)"
+        no-caps
+        icon="la:arrow-circle-left"
+        @click="switchTo(`login`)" />
+    </template>
+  </div>
+</template>
+
+<script setup>
+import { useI18n } from 'vue-i18n'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
+
+import { loading } from '@/composables/loading'
+import { notify } from '@/composables/notify'
+import { useDark } from '@/composables/dark'
+import { apiErrorMessage } from '@/helpers/apiError'
+import { copyToClipboard } from '@/helpers/clipboard'
+import { localizeError } from '@/helpers/localization'
+import { loginDestination, redirectTargetOr } from '@/helpers/loginRedirect'
+
+import { useAuthConfigStore } from '@/stores/authConfig'
+import { useCommonStore } from '@/stores/common'
+import { useSiteStore } from '@/stores/site'
+import { useUserStore } from '@/stores/user'
+
+import zxcvbn from 'zxcvbn'
+import { browserSupportsWebAuthn, startAuthentication } from '@simplewebauthn/browser'
+import VOtpInput from 'vue3-otp-input'
+
+// COMPOSABLES
+
+const dark = useDark()
+
+// STORES
+
+const authConfigStore = useAuthConfigStore()
+const commonStore = useCommonStore()
+const siteStore = useSiteStore()
+const userStore = useUserStore()
+
+// I18N
+
+const { t } = useI18n()
+
+// DATA
+
+const state = reactive({
+  strategies: [],
+  selectedStrategyId: null,
+  screen: 'login',
+  username: '',
+  password: '',
+  securityCode: '',
+  continuationToken: '',
+  /**
+   * Whether the change-password screen was reached part way through a login, which proves the
+   * current password already -- so the form asks only for the new one. Decided as the screen opens
+   * rather than read off `continuationToken` as it goes: a successful change answers with no token,
+   * and the form would put the current-password field back under the overlay on the way out.
+   */
+  changePwdForced: false,
+  newName: '',
+  newEmail: '',
+  newPassword: '',
+  newPasswordVerify: '',
+  /** Set from `?reset=` on the way in; what the reset screen submits with the new password. */
+  resetToken: '',
+  /** Set from `?verify=` on the way in; what the confirm screen submits when it is pressed. */
+  verifyToken: '',
+  /** Whether the strategies have been fetched — settled either way, so a failure still draws. */
+  strategiesLoaded: false,
+  /** What the success screen says. Set by `showSuccess()`, never read anywhere else. */
+  successMessage: '',
+  successCaption: '',
+  /** What the error box above the panel says, if anything. Set by `showError()`. */
+  errorMessage: '',
+  errorCaption: '',
+  /*
+    Whether a request that could carry the flow forward is already out.
+
+    Every screen here can be submitted twice inside the time one request takes: a password manager
+    fills the form and presses the button, `v-otp-input` emits `on-complete` again as the last of the
+    six boxes settles, someone double-clicks. The second attempt is never a second login -- it spends
+    a continuation token the first one has already spent -- so the server refuses it, and the panel
+    paints that refusal over a login that in fact succeeded, or drops the reader back to the login
+    form a beat before the redirect fires. It also costs another attempt against the auth rate limit,
+    which is what eventually locks the address out for a quarter of an hour.
+  */
+  isSubmitting: false,
+  /** Whether the site's Bypass Login Screen has already sent the browser on to the provider. */
+  isAutoLoginRedirecting: false,
+  isTFAShown: false,
+  isTFASetupShown: false,
+  tfaQRImage: '',
+  tfaSecret: ''
+})
+
+// REFS
+
+const loginEmailIpt = ref(null)
+const forgotEmailIpt = ref(null)
+const registerNameIpt = ref(null)
+const changePwdCurrentIpt = ref(null)
+const changePwdNewPwdIpt = ref(null)
+const loginForm = ref(null)
+const forgotForm = ref(null)
+const registerForm = ref(null)
+const changePwdForm = ref(null)
+const resetPwdForm = ref(null)
+
+// COMPUTED
+
+/*
+  The two kinds of strategy this screen deals with, and they are drawn nothing alike: one is a username
+  and a password typed here, the other is a button that leaves for the provider. Splitting them is also
+  what stops a provider from being picked in the selector above the form, where it would then be asked
+  for a password it has no use for.
+*/
+const formStrategies = computed(() =>
+  state.strategies.filter((str) => str.activeStrategy?.strategy?.useForm !== false)
+)
+
+const redirectStrategies = computed(() =>
+  state.strategies.filter((str) => str.activeStrategy?.strategy?.useForm === false)
+)
+
+const selectedStrategy = computed(() => {
+  return (
+    (state.selectedStrategyId && state.strategies.find((s) => s.id === state.selectedStrategyId)) ||
+    {}
+  )
+})
+
+const passwordStrength = computed(() => {
+  if (state.newPassword.length < 8) {
+    return {
+      color: 'negative',
+      label: t('common.password.weak')
+    }
+  } else {
+    switch (zxcvbn(state.newPassword).score) {
+      case 1:
+        return {
+          color: 'deep-orange-7',
+          label: t('common.password.poor')
+        }
+      case 2:
+        return {
+          color: 'purple-7',
+          label: t('common.password.average')
+        }
+      case 3:
+        return {
+          color: 'blue-7',
+          label: t('common.password.good')
+        }
+      case 4:
+        return {
+          color: 'green-7',
+          label: t('common.password.strong')
+        }
+      default:
+        return {
+          color: 'negative',
+          label: t('common.password.weak')
+        }
+    }
+  }
+})
+
+/*
+  Both halves have to hold: an instance can turn passkeys off, and a browser that cannot do WebAuthn
+  cannot answer a challenge. The button is absent rather than disabled either way -- there is nothing
+  a person could do about either one from this screen.
+*/
+const canUsePasskeys = computed(() => {
+  return authConfigStore.allowPasskeys && browserSupportsWebAuthn()
+})
+
+/** The 2FA secret in groups of four, which is how a 32-character string stays readable to type. */
+const groupedTfaSecret = computed(() => state.tfaSecret.replace(/.{4}(?=.)/g, '$& '))
+
+/*
+  What the labels on the panel's flat "acrylic" buttons are coloured -- the passkey and provider
+  buttons, and every link-like one at the foot of a screen.
+
+  `primary` is a mid-tone picked to read on white, and this panel sits straight on the page rather
+  than in a card: white in light mode, `dark-6` in dark, where the same blue is the ~2.7:1 that
+  `--color-primary-light` exists for. Only the text: the buttons keep their `primary` fill, which is
+  a 10% tint that a lighter colour would wash out.
+
+  Bound rather than written in the stylesheet because `WBtn` resolves both colours to inline styles,
+  which no rule outside it can beat without `!important`.
+*/
+const acrylicBtnTextColor = computed(() => (dark.isActive ? 'primary-light' : 'primary'))
+
+// VALIDATION RULES
+
+const loginUsernameValidation = [(val) => val.length > 0 || t('auth.errors.missingUsername')]
+
+const loginPasswordValidation = [(val) => val.length > 0 || t('auth.errors.missingPassword')]
+
+const userNameValidation = [
+  (val) => val.length > 0 || t('auth.errors.missingName'),
+  (val) => /^[^<>"]+$/.test(val) || t('auth.errors.invalidName')
+]
+
+const userEmailValidation = [
+  (val) => val.length > 0 || t('auth.errors.missingEmail'),
+  (val) => /^.+@.+\..+$/.test(val) || t('auth.errors.invalidEmail')
+]
+
+const userPasswordValidation = [
+  (val) => val.length > 0 || t('auth.errors.missingPassword'),
+  (val) => val.length >= 8 || t('auth.errors.passwordTooShort')
+]
+
+const userPasswordVerifyValidation = [
+  (val) => val.length > 0 || t('auth.errors.missingVerifyPassword'),
+  (val) => val === state.newPassword || t('auth.errors.passwordsNotMatch')
+]
+
+// METHODS
+
+/**
+ * Switch the form to another strategy, and put the cursor where the credentials start.
+ *
+ * A switch changes what the form is asking for — the username field's label and its validation rules
+ * both belong to the strategy — but it reuses the same elements, so nothing moves focus on its own,
+ * and somebody who has just picked a different provider is left with a form they have to click into.
+ *
+ * Unconditionally, including a click on the strategy already selected: pressing one of these buttons
+ * has already taken the caret out of whichever field it was in and put it on the button itself, so
+ * there is nothing left to preserve and nowhere better for it to go.
+ */
+function selectFormStrategy(strategyId) {
+  state.selectedStrategyId = strategyId
+  nextTick(() => {
+    loginEmailIpt.value?.focus()
+  })
+}
+
+function switchTo(screen) {
+  switch (screen) {
+    case 'login': {
+      state.screen = 'login'
+      nextTick(() => {
+        // -> Absent on a site whose every strategy signs in elsewhere
+        loginEmailIpt.value?.focus()
+      })
+      break
+    }
+    case 'forgot': {
+      state.screen = 'forgot'
+      nextTick(() => {
+        forgotEmailIpt.value.focus()
+      })
+      break
+    }
+    case 'register': {
+      state.screen = 'register'
+      nextTick(() => {
+        registerNameIpt.value.focus()
+      })
+      break
+    }
+    default: {
+      throw new Error('Invalid Screen')
+    }
+  }
+  /*
+    A screen change is a fresh start, so whatever the last one was complaining about goes with it.
+    The two flows that mean to carry a message across a change — a 2FA token the server has discarded,
+    a confirmation link that was refused — move first and call `showError()` after, which is the whole
+    reason this clears here rather than in `showError()`'s callers.
+  */
+  clearError()
+}
+
+/**
+ * Say what went wrong, in the box above the panel.
+ *
+ * @param message What failed
+ * @param caption The underlying reason, where the message is a summary of it
+ */
+function showError(message, caption = '') {
+  state.errorMessage = message
+  state.errorCaption = caption
+}
+
+/** Take the error box away. Called as each action starts, so nothing answers for the previous one. */
+function clearError() {
+  state.errorMessage = ''
+  state.errorCaption = ''
+}
+
+/**
+ * End a flow on the success screen.
+ *
+ * Every flow that gets here is finished — there is nothing to continue and no session to carry on
+ * with — so the screen's own way out is always the link back to the login form, and this only has to
+ * say what happened.
+ *
+ * @param message What was accomplished
+ * @param caption What the reader does next, where that is not the login form itself
+ */
+function showSuccess(message, caption = '') {
+  state.successMessage = message
+  state.successCaption = caption
+  state.screen = 'success'
+  // -> Not via `switchTo()`, so the clearing that comes with a screen change has to be said here
+  clearError()
+}
+
+async function fetchStrategies(showAll = false) {
+  try {
+    state.strategies = await API_CLIENT.get(`sites/${siteStore.id}/auth/strategies`, {
+      searchParams: {
+        visibleOnly: !showAll
+      }
+    }).json()
+    // -> The selection drives the form, so it has to be a strategy that has one
+    state.selectedStrategyId = formStrategies.value[0]?.id ?? null
+  } catch (err) {
+    // -> Said out loud rather than left as an unhandled rejection: what the reader is looking at is
+    //    a login form with no strategy behind it, and a submit that cannot go anywhere
+    showError(t('auth.genericError'), apiErrorMessage(err))
+  } finally {
+    // -> In a `finally`, so a wiki whose strategies could not be fetched still shows its form rather
+    //    than spinning for ever
+    state.strategiesLoaded = true
+  }
+}
+
+/**
+ * Where a provider button goes: the backend builds the URL at the provider, because everything that
+ * ties the answer back to this browser — `state`, `nonce`, the PKCE verifier — is generated there and
+ * kept on the session.
+ */
+function authorizeUrl(str) {
+  const params = new URLSearchParams({ siteId: siteStore.id })
+  /*
+    The page the reader was sent here from, if any. The provider flow cannot come back through the
+    code below -- it lands on the callback route, which redirects -- so the destination travels with
+    the request and is handed back by the callback instead. Without one, the server falls back to the
+    login redirect settings.
+  */
+  const destination = loginDestination()
+  if (destination) {
+    params.set('redirect', destination)
+  }
+  return `/_api/auth/${str.id}/authorize?${params.toString()}`
+}
+
+async function handleLoginResponse(resp) {
+  state.continuationToken = resp.continuationToken
+  switch (resp.nextAction) {
+    case 'changePassword': {
+      state.screen = 'changePwd'
+      state.changePwdForced = Boolean(state.continuationToken)
+      nextTick(() => {
+        if (state.changePwdForced) {
+          changePwdNewPwdIpt.value.focus()
+        } else {
+          changePwdCurrentIpt.value.focus()
+        }
+      })
+      loading.hide()
+      break
+    }
+    case 'provideTfa': {
+      state.securityCode = ''
+      state.screen = 'tfa'
+      loading.hide()
+      break
+    }
+    case 'setupTfa': {
+      state.securityCode = ''
+      state.screen = 'tfasetup'
+      state.tfaQRImage = resp.tfaQRImage
+      state.tfaSecret = resp.tfaSecret
+      loading.hide()
+      break
+    }
+    /*
+      Registration on a site that confirms addresses. Nothing to continue here: the link in the email
+      is what finishes it, and there is no session until the new account signs in for itself.
+    */
+    case 'verifyEmail': {
+      loading.hide()
+      showSuccess(t('auth.registerSuccess'), t('auth.registerCheckEmail'))
+      break
+    }
+    case 'redirect': {
+      /*
+        No delay, unlike every other use of the overlay: this one is not covering a wait, it IS the
+        confirmation — the reader is leaving for another page a second from now and this line is the
+        only thing that will have said the login worked. Left on the default 500ms it would appear
+        halfway through that second, or not at all when the response was already slow enough for the
+        overlay to be up.
+      */
+      loading.show({
+        message: t('auth.loginSuccess'),
+        delay: 0
+      })
+      /*
+        The page the reader was sent here from wins; a login somebody chose to make goes where the
+        server says, which is the first-login or login redirect of their groups or the site.
+      */
+      setTimeout(() => {
+        window.location.replace(loginDestination() ?? redirectTargetOr(resp.redirect))
+      }, 1000)
+      break
+    }
+    default: {
+      loading.hide()
+      showError('Unexpected Authentication Response')
+    }
+  }
+}
+
+/**
+ * LOGIN
+ */
+async function login() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.signingIn')
+  })
+  try {
+    const isFormValid = await loginForm.value.validate(true)
+    if (!isFormValid) {
+      throw new Error(t('auth.errors.login'))
+    }
+    const resp = await API_CLIENT.put(`sites/${siteStore.id}/auth/login`, {
+      json: {
+        strategyId: state.selectedStrategyId,
+        username: state.username,
+        password: state.password
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (resp.ok) {
+      state.password = ''
+      handleLoginResponse(resp)
+    } else {
+      throw new Error(resp.message || 'ERR_LOGIN_FAILED')
+    }
+  } catch (err) {
+    console.warn(err)
+    loading.hide()
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * LOGIN WITH PASSKEY
+ */
+async function loginWithPasskey() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.signingIn')
+  })
+  try {
+    const respGen = await API_CLIENT.post(`sites/${siteStore.id}/auth/passkey/challenge`).json()
+    if (!respGen?.ok) {
+      throw new Error(respGen?.message || 'ERR_LOGIN_FAILED')
+    }
+
+    // -> No `useBrowserAutofill`: that fills a passkey into a form field the user is typing in, and
+    //    there is no field here -- this opens the browser's own account picker instead
+    const authResp = await startAuthentication({ optionsJSON: respGen.authOptions })
+
+    const respVerif = await API_CLIENT.put(`sites/${siteStore.id}/auth/passkey/login`, {
+      json: {
+        authResponse: authResp
+      }
+    }).json()
+    if (!respVerif?.ok) {
+      throw new Error(respVerif?.message || 'ERR_LOGIN_FAILED')
+    }
+    await handleLoginResponse(respVerif)
+  } catch (err) {
+    loading.hide()
+    // -> Dismissing the browser's passkey prompt is not a failure to report: the user asked for the
+    //    prompt and then changed their mind, and is looking at the login form again either way
+    if (err.name === 'NotAllowedError' || err.name === 'AbortError') {
+      return
+    }
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * FORGOT PASSWORD
+ */
+async function forgotPassword() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.forgotPasswordLoading')
+  })
+  try {
+    const isFormValid = await forgotForm.value.validate(true)
+    if (!isFormValid) {
+      throw new Error(t('auth.errors.forgotPassword'))
+    }
+    const resp = await API_CLIENT.post(`sites/${siteStore.id}/auth/forgotPassword`, {
+      json: {
+        strategyId: state.selectedStrategyId,
+        email: state.username,
+        /*
+          What language to write the mail in, for an account whose owner has never said. There is
+          nothing else to go on at this point -- the form is filled by somebody who is not signed in
+          -- and the language the wiki is being read in right now is a better guess than the site's
+          own, which is what the server falls back to.
+        */
+        locale: commonStore.locale
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(resp?.message || 'ERR_FORGOT_PASSWORD_FAILED')
+    }
+    loading.hide()
+    /*
+      The same answer for an address nobody here has, which is what the endpoint gives back and what
+      this has to keep: saying "no such account" on a public form is how a wiki's member list gets
+      read off it one address at a time.
+    */
+    showSuccess(t('auth.forgotPasswordSuccessTitle'), t('auth.forgotPasswordSuccess'))
+  } catch (err) {
+    loading.hide()
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * RESET PASSWORD
+ *
+ * The other end of the link in a reset email. Nothing signs the user in here — the token stands for
+ * the mailbox rather than for a half-finished login — so what follows a successful reset is the
+ * success screen, and the login form is a link away from it, with the new password to type into it.
+ */
+async function resetPassword() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.changePwd.loading')
+  })
+  try {
+    const isFormValid = await resetPwdForm.value.validate(true)
+    if (!isFormValid) {
+      throw new Error(t('auth.errors.fields'))
+    }
+    const resp = await API_CLIENT.post(`sites/${siteStore.id}/auth/resetPassword`, {
+      json: {
+        token: state.resetToken,
+        newPassword: state.newPassword
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(resp?.message || 'ERR_CHANGE_PASSWORD_FAILED')
+    }
+    loading.hide()
+    state.resetToken = ''
+    state.newPassword = ''
+    state.newPasswordVerify = ''
+    clearQueryParams(['reset'])
+    showSuccess(t('auth.resetPwd.success'))
+  } catch (err) {
+    loading.hide()
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * REGISTER
+ */
+async function register() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  try {
+    const isFormValid = await registerForm.value.validate(true)
+    if (!isFormValid) {
+      throw new Error(t('auth.errors.register'))
+    }
+    loading.show({
+      message: t('auth.registering')
+    })
+    const resp = await API_CLIENT.post(`sites/${siteStore.id}/auth/register`, {
+      json: {
+        strategyId: state.selectedStrategyId,
+        name: state.newName,
+        email: state.newEmail,
+        password: state.newPassword,
+        // -> Kept as the new account's own language preference, as well as used for the welcome
+        //    mail: signing up while reading the wiki in French says which language to write in
+        locale: commonStore.locale
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(resp?.message || 'ERR_REGISTRATION_FAILED')
+    }
+    state.password = ''
+    state.newName = ''
+    state.newEmail = ''
+    state.newPassword = ''
+    state.newPasswordVerify = ''
+    await handleLoginResponse(resp)
+  } catch (err) {
+    loading.hide()
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * CHANGE PASSWORD
+ */
+async function changePwd() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  try {
+    const isFormValid = await changePwdForm.value.validate(true)
+    if (!isFormValid) {
+      throw new Error(t('auth.errors.register'))
+    }
+    const resp = await API_CLIENT.put(`sites/${siteStore.id}/auth/changePassword`, {
+      json: {
+        strategyId: state.selectedStrategyId,
+        continuationToken: state.continuationToken,
+        newPassword: state.newPassword
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (resp.ok) {
+      state.password = ''
+      notify({
+        type: 'positive',
+        message: t('auth.changePwd.success')
+      })
+      await handleLoginResponse(resp)
+    } else {
+      throw new Error(resp.message || 'ERR_CHANGE_PASSWORD_FAILED')
+    }
+  } catch (err) {
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * Send the security code for the login this panel is in the middle of.
+ *
+ * The continuation token is only cleared once the code is accepted: a mistyped one can be entered
+ * again, up to the handful of attempts the server allows before it discards the token.
+ *
+ * @param setup True on the setup screen, where a correct code also activates the new secret
+ * @returns The login response, to be handed to `handleLoginResponse()`
+ */
+async function submitTFA(setup) {
+  if (!/^[0-9]{6}$/.test(state.securityCode)) {
+    throw new Error(t('auth.errors.tfaMissing'))
+  }
+  const resp = await API_CLIENT.put(`sites/${siteStore.id}/auth/tfa`, {
+    json: {
+      strategyId: state.selectedStrategyId,
+      continuationToken: state.continuationToken,
+      securityCode: state.securityCode,
+      setup
+    }
+  }).json()
+  if (!resp?.ok) {
+    throw new Error(resp?.message || 'ERR_LOGIN_FAILED')
+  }
+  state.continuationToken = ''
+  state.securityCode = ''
+  return resp
+}
+
+/**
+ * Report a failed 2FA attempt, and start the login over when there is nothing left to continue: an
+ * expired token, or one the server has discarded after too many wrong codes, leaves this screen with
+ * no way forward.
+ */
+async function handleTFAError(err) {
+  const code = apiErrorMessage(err)
+  loading.hide()
+  if (code === 'ERR_INVALID_VALIDATION_TOKEN' || code === 'ERR_EXPIRED_VALIDATION_TOKEN') {
+    state.continuationToken = ''
+    state.securityCode = ''
+    state.password = ''
+    switchTo('login')
+  }
+  // -> After the screen change above, which clears the box this is about to fill
+  showError(localizeError(code, t))
+}
+
+async function verifyTFA() {
+  /*
+    `continuationToken` as well as the flag: `submitTFA` spends the token on the way out, and the OTP
+    boxes keep their digits when the model behind them is cleared -- so an autofill that writes them
+    a second time re-emits a code the login it belonged to has already finished with.
+  */
+  if (state.isSubmitting || !state.continuationToken) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.signingIn')
+  })
+  try {
+    await handleLoginResponse(await submitTFA(false))
+  } catch (err) {
+    await handleTFAError(err)
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * Copy the setup key shown under the QR code, for typing it into an authenticator app by hand.
+ */
+async function copyTfaSecret() {
+  try {
+    // -> Without the display grouping: a space is harmless in most authenticator apps, but not all
+    await copyToClipboard(state.tfaSecret)
+    notify({
+      type: 'positive',
+      message: t('auth.tfaSetupKeyCopied')
+    })
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('auth.tfaSetupKeyCopyFailed'),
+      caption: err.message
+    })
+  }
+}
+
+/**
+ * FINISH TFA SETUP
+ */
+async function finishSetupTFA() {
+  // -> As `verifyTFA`: no token left means the code in the boxes belongs to a finished login
+  if (state.isSubmitting || !state.continuationToken) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.tfaSetupVerifying')
+  })
+  try {
+    const resp = await submitTFA(true)
+    notify({
+      type: 'positive',
+      message: t('auth.tfaSetupSuccess')
+    })
+    await handleLoginResponse(resp)
+  } catch (err) {
+    await handleTFAError(err)
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * CONFIRM EMAIL
+ *
+ * The press the confirm screen exists for. Nobody is signed in by it — the browser reading the mail
+ * is not necessarily the one that registered — so what follows is the success screen, with the login
+ * form a link away. The token is spent either way, so it leaves the address bar here as it does on
+ * the paths through `cancelVerifyEmail()`.
+ */
+async function confirmEmail() {
+  if (state.isSubmitting) {
+    return
+  }
+  state.isSubmitting = true
+  clearError()
+  loading.show({
+    message: t('auth.verifyEmail.loading')
+  })
+  try {
+    const resp = await API_CLIENT.post(`sites/${siteStore.id}/auth/verifyEmail`, {
+      json: {
+        token: state.verifyToken
+      },
+      throwHttpErrors: (statusNumber) => statusNumber > 400 // Don't throw for 400
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(resp?.message || 'ERR_INVALID_VALIDATION_TOKEN')
+    }
+    loading.hide()
+    state.verifyToken = ''
+    clearQueryParams(['verify'])
+    showSuccess(t('auth.verifyEmail.success'))
+  } catch (err) {
+    loading.hide()
+    // -> Nothing left to press: a token that was refused is not going to be accepted on a second try
+    cancelVerifyEmail()
+    // -> After the screen change, which clears the box this is about to fill
+    showError(localizeError(apiErrorMessage(err), t))
+  } finally {
+    state.isSubmitting = false
+  }
+}
+
+/**
+ * Leave the confirm screen, spent token or backed-out one alike, and take it out of the address bar:
+ * left there, reloading the page would offer a confirmation that cannot succeed.
+ */
+function cancelVerifyEmail() {
+  state.verifyToken = ''
+  clearQueryParams(['verify'])
+  switchTo('login')
+}
+
+/**
+ * Leave the reset screen without using the link, and take the token out of the address bar with it:
+ * left there, reloading the page would drop the reader straight back into a screen they backed out of.
+ */
+function cancelReset() {
+  state.resetToken = ''
+  state.newPassword = ''
+  state.newPasswordVerify = ''
+  clearQueryParams(['reset'])
+  switchTo('login')
+}
+
+// MOUNTED
+
+onMounted(async () => {
+  /*
+    Both before the fetch, and therefore before anything is drawn: the panel is held back until the
+    strategies arrive, so setting the screen now means the right one is the FIRST to mount. Done
+    afterwards it would mount the login form, focus its email field and then take both away again —
+    and, now that a failed provider login is a box above the form rather than a toast beside it, it
+    would push that form down a beat after it was first painted.
+
+    Neither reads anything but the URL, so there is nothing to wait for. A fetch that then fails says
+    so over the top of this, which is the right way round: a login screen with no strategy behind it
+    is the larger problem of the two.
+  */
+  screenFromQuery()
+  reportRedirectLoginError()
+  await fetchStrategies(showsAllStrategies())
+  autoLogin()
+})
+
+/**
+ * Whether the login screen was opened with `?all=1`, which lists the providers the site hides as well
+ * as the ones it shows, and stays put rather than bypassing the screen. It is how an administrator
+ * reaches the local login on a site that hides it behind a single sign-on provider, as the admin
+ * area's Login screen tells them.
+ */
+function showsAllStrategies() {
+  return new URLSearchParams(window.location.search).get('all') === '1'
+}
+
+/**
+ * The site's Bypass Login Screen: go straight to the first strategy's provider rather than showing a
+ * screen whose only useful content is its button.
+ *
+ * Only where that strategy signs in elsewhere -- a form strategy needs this screen to type into. And
+ * only on the plain login screen with nothing to report: a reset or confirmation link came here for
+ * its own screen, and a provider login that just failed would otherwise be sent straight back to the
+ * provider to fail again, in a loop the reader never gets to see the reason for. And never with
+ * `?all=1`, which is an administrator asking for the screen this would skip.
+ *
+ * `replace` rather than a navigation, so Back from the provider does not land here and bounce the
+ * reader forward again.
+ */
+function autoLogin() {
+  if (
+    !siteStore.auth.autoLogin ||
+    state.screen !== 'login' ||
+    state.errorMessage ||
+    showsAllStrategies()
+  ) {
+    return
+  }
+  const first = state.strategies[0]
+  if (first?.activeStrategy?.strategy?.useForm !== false) {
+    return
+  }
+  state.isAutoLoginRedirecting = true
+  window.location.replace(authorizeUrl(first))
+}
+
+/**
+ * Say what went wrong on a login that happened somewhere else.
+ *
+ * A provider login fails at the callback route, which has a browser to redirect and no request to
+ * answer — so it puts the reason in the URL and this puts it in front of the reader. Taken out of the
+ * address bar afterwards, so that reloading the page does not report it a second time.
+ */
+function reportRedirectLoginError() {
+  const code = new URLSearchParams(window.location.search).get('error')
+  if (!code) {
+    return
+  }
+  showError(t('auth.errors.loginError'), localizeError(code, t))
+  clearQueryParams(['error'])
+}
+
+/**
+ * Which screen a link asked for, and the token it carries.
+ *
+ * Both are one-way: nothing switches to them afterwards, so unlike `switchTo` this only sets state —
+ * the screen's own field focuses itself when it mounts. The token stays in the address bar until it
+ * has been used or the screen is left, since it is what the request is made with and a reload before
+ * then should land back here rather than on a form with nothing behind it.
+ */
+function screenFromQuery() {
+  const params = new URLSearchParams(window.location.search)
+  const verify = params.get('verify')
+  if (verify) {
+    state.verifyToken = verify
+    state.screen = 'verifyEmail'
+    return
+  }
+  const reset = params.get('reset')
+  if (reset) {
+    state.resetToken = reset
+    state.screen = 'resetPwd'
+  }
+}
+
+/**
+ * Take parameters out of the address bar without navigating.
+ *
+ * Everything this screen is told by URL — a failed provider login, a confirmation token, a reset
+ * token — is spent once it has been acted on, and reloading the page must not offer it again.
+ */
+function clearQueryParams(keys) {
+  const params = new URLSearchParams(window.location.search)
+  for (const key of keys) {
+    params.delete(key)
+  }
+  const query = params.toString()
+  window.history.replaceState(
+    window.history.state,
+    '',
+    `${window.location.pathname}${query ? `?${query}` : ''}`
+  )
+}
+</script>

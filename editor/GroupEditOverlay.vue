@@ -1,0 +1,1842 @@
+<template>
+  <w-layout view="hHh lpR fFf" container>
+    <w-header class="card-header px-4 py-2">
+      <w-icon name="img:/_assets/icons/fluent-people.svg" left size="md" />
+      <div>
+        <span>{{ t(`admin.groups.edit`) }}</span>
+        <div class="text-caption">{{ state.group.name }}</div>
+      </div>
+      <w-space />
+      <w-btn-group push>
+        <w-btn
+          push
+          color="grey-6"
+          text-color="white"
+          :aria-label="t(`common.actions.refresh`)"
+          icon="la:redo-alt"
+          @click="refresh">
+          <w-tooltip anchor="center left" self="center right">{{
+            t(`common.actions.refresh`)
+          }}</w-tooltip>
+        </w-btn>
+        <w-btn
+          push
+          color="white"
+          text-color="grey-7"
+          :label="t(`common.actions.close`)"
+          icon="la:times"
+          @click="close" />
+        <w-btn
+          push
+          color="positive"
+          text-color="white"
+          :label="t(`common.actions.save`)"
+          icon="la:check"
+          :loading="state.isLoading"
+          v-if="canManage"
+          @click="save" />
+      </w-btn-group>
+    </w-header>
+    <w-drawer class="bg-dark-6" :model-value="true" :width="250" dark>
+      <w-list padding dark v-show="!state.isLoading">
+        <template v-for="sc of sections" :key="`section-` + sc.key">
+          <w-item
+            v-if="!(isGuestGroup && sc.excludeGuests)"
+            clickable
+            :to="{ params: { section: sc.key } }"
+            active-class="bg-primary text-white"
+            :disabled="sc.disabled">
+            <w-item-section side><w-icon :name="sc.icon" color="white" /></w-item-section>
+            <w-item-section>{{ sc.text }}</w-item-section>
+            <w-item-section side v-if="sc.usersTotal">
+              <w-badge color="dark-3" :label="state.usersTotal" />
+            </w-item-section>
+            <w-item-section side v-if="sc.rulesTotal && state.group.rules">
+              <w-badge color="dark-3" :label="state.group.rules.length" />
+            </w-item-section>
+          </w-item>
+        </template>
+      </w-list>
+    </w-drawer>
+    <w-page-container>
+      <w-page v-if="state.isLoading" />
+      <!-- ----------------------------------------------------------------------- -->
+      <!-- OVERVIEW -->
+      <!-- ----------------------------------------------------------------------- -->
+      <w-page v-else-if="route.params.section === `overview`">
+        <div class="p-4">
+          <div class="grid grid-cols-12 gap-4">
+            <div class="col-span-12 lg:col-span-8">
+              <w-card class="shadow-1 pb-2">
+                <w-card-header>{{ t('admin.groups.general') }}</w-card-header>
+                <w-item>
+                  <blueprint-icon icon="team" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`admin.groups.name`) }}</w-item-label>
+                    <w-item-label caption>{{ t(`admin.groups.nameHint`) }}</w-item-label>
+                  </w-item-section>
+                  <w-item-section>
+                    <w-input
+                      outlined
+                      v-model="state.group.name"
+                      dense
+                      :rules="groupNameValidation"
+                      hide-bottom-space
+                      :aria-label="t(`admin.groups.name`)"
+                      :disable="isGuestGroup || !canManage" />
+                  </w-item-section>
+                </w-item>
+              </w-card>
+              <w-card class="shadow-1 pb-2 mt-4" v-if="!isGuestGroup">
+                <w-card-header>{{ t('admin.groups.authBehaviors') }}</w-card-header>
+                <w-item>
+                  <blueprint-icon icon="double-right" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`admin.groups.redirectOnLogin`) }}</w-item-label>
+                    <w-item-label caption>{{ t(`admin.groups.redirectOnLoginHint`) }}</w-item-label>
+                  </w-item-section>
+                  <w-item-section>
+                    <w-input
+                      outlined
+                      v-model="state.group.redirectOnLogin"
+                      dense
+                      :rules="redirectRules"
+                      hide-bottom-space
+                      :disable="!canManage"
+                      :aria-label="t(`admin.groups.redirectOnLogin`)" />
+                  </w-item-section>
+                </w-item>
+                <w-separator class="my-2" inset />
+                <w-item>
+                  <blueprint-icon icon="chevron-right" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`admin.groups.redirectOnFirstLogin`) }}</w-item-label>
+                    <w-item-label caption>{{
+                      t(`admin.groups.redirectOnFirstLoginHint`)
+                    }}</w-item-label>
+                  </w-item-section>
+                  <w-item-section>
+                    <w-input
+                      outlined
+                      v-model="state.group.redirectOnFirstLogin"
+                      dense
+                      :rules="redirectRules"
+                      hide-bottom-space
+                      :disable="!canManage"
+                      :aria-label="t(`admin.groups.redirectOnLogin`)" />
+                  </w-item-section>
+                </w-item>
+                <w-separator class="my-2" inset />
+                <w-item>
+                  <blueprint-icon icon="exit" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`admin.groups.redirectOnLogout`) }}</w-item-label>
+                    <w-item-label caption>{{
+                      t(`admin.groups.redirectOnLogoutHint`)
+                    }}</w-item-label>
+                  </w-item-section>
+                  <w-item-section>
+                    <w-input
+                      outlined
+                      v-model="state.group.redirectOnLogout"
+                      dense
+                      :rules="redirectRules"
+                      hide-bottom-space
+                      :disable="!canManage"
+                      :aria-label="t(`admin.groups.redirectOnLogout`)" />
+                  </w-item-section>
+                </w-item>
+              </w-card>
+            </div>
+            <div class="col-span-12 lg:col-span-4">
+              <w-card class="shadow-1 pb-2">
+                <w-card-header>{{ t('admin.groups.info') }}</w-card-header>
+                <w-item>
+                  <blueprint-icon icon="team" :hue-rotate="-45" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`common.field.id`) }}</w-item-label>
+                    <w-item-label
+                      ><strong>{{ state.group.id }}</strong></w-item-label
+                    >
+                  </w-item-section>
+                </w-item>
+                <w-separator class="my-2" inset />
+                <w-item>
+                  <blueprint-icon icon="calendar-plus" :hue-rotate="-45" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`common.field.createdOn`) }}</w-item-label>
+                    <w-item-label>
+                      <strong>{{ humanizeDate(state.group.createdAt) }}</strong>
+                    </w-item-label>
+                  </w-item-section>
+                </w-item>
+                <w-separator class="my-2" inset />
+                <w-item>
+                  <blueprint-icon icon="summertime" :hue-rotate="-45" />
+                  <w-item-section>
+                    <w-item-label>{{ t(`common.field.lastUpdated`) }}</w-item-label>
+                    <w-item-label>
+                      <strong>{{ humanizeDate(state.group.updatedAt) }}</strong>
+                    </w-item-label>
+                  </w-item-section>
+                </w-item>
+              </w-card>
+            </div>
+          </div>
+        </div>
+      </w-page>
+      <!-- ----------------------------------------------------------------------- -->
+      <!-- RULES -->
+      <!-- ----------------------------------------------------------------------- -->
+      <w-page v-else-if="route.params.section === `rules`">
+        <w-toolbar
+          class="pl-4"
+          :class="dark.isActive ? `bg-dark-3 text-white` : `bg-white text-dark`">
+          <div class="text-subtitle1">{{ t('admin.groups.rules') }}</div>
+          <w-space />
+          <w-btn
+            class="acrylic-btn mr-2"
+            icon="la:question-circle"
+            flat
+            color="grey"
+            type="a"
+            :href="siteStore.docsBase + `/admin/permissions#page-rules`"
+            target="_blank"
+            :aria-label="t(`common.actions.viewDocs`)">
+            <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+          </w-btn>
+          <w-btn
+            class="acrylic-btn mr-2"
+            flat
+            :color="dark.isActive ? `indigo-4` : `indigo`"
+            icon="la:file-export"
+            @click="exportRules">
+            <w-tooltip>{{ t('admin.groups.exportRules') }}</w-tooltip>
+          </w-btn>
+          <w-btn
+            class="acrylic-btn mr-2"
+            flat
+            :color="dark.isActive ? `indigo-4` : `indigo`"
+            icon="la:file-import"
+            v-if="canManage"
+            @click="importRules">
+            <w-tooltip>{{ t('admin.groups.importRules') }}</w-tooltip>
+          </w-btn>
+          <w-btn
+            v-if="canManage"
+            unelevated
+            color="primary"
+            icon="la:plus"
+            label="New Rule"
+            @click="newRule" />
+        </w-toolbar>
+        <w-separator />
+        <div class="p-4">
+          <w-banner
+            v-if="!state.group.rules || state.group.rules.length < 1"
+            rounded
+            :class="dark.isActive ? `bg-negative text-white` : `bg-grey-4 text-grey-9`"
+            >{{ t('admin.groups.rulesNone') }}</w-banner
+          >
+          <w-card class="shadow-1 pb-2" v-else>
+            <w-card-section>
+              <div class="admin-groups-rule" v-for="rule of state.group.rules" :key="rule.id">
+                <!-- -> The timeline down the left, which the mode button's disc sits at the top of -->
+                <div class="admin-groups-rule-icon" :class="getRuleModeColor(rule.mode)" />
+                <div class="admin-groups-rule-name">
+                  <!--
+                    The disc and the mode name are one button opening the choice of mode
+                    (`RuleModeMenu`), so the whole of it is one target with one hover. It reaches back
+                    over the timeline's column to put the disc where it has always been. Disabled for a
+                    reader who may look at a rule but not change it.
+                  -->
+                  <button
+                    type="button"
+                    class="admin-groups-rule-mode w-unstyled"
+                    :class="getRuleModeColor(rule.mode)"
+                    :disabled="!canManage">
+                    <span class="admin-groups-rule-mode-disc">
+                      <w-icon :name="getRuleModeIcon(rule.mode)" />
+                    </span>
+                    <strong>{{ getRuleModeName(rule.mode) }}</strong>
+                    <w-icon v-if="canManage" name="la:angle-down" size="10px" />
+                    <rule-mode-menu :mode="rule.mode" @select="(mode) => setRuleMode(rule, mode)" />
+                  </button>
+                  <w-separator class="ml-2 mr-1" vertical />
+                  <input
+                    type="text"
+                    v-model="rule.name"
+                    placeholder="Rule Name"
+                    :disabled="!canManage" />
+                  <w-btn
+                    v-if="canManage"
+                    class="admin-groups-rule-delete"
+                    flat
+                    round
+                    dense
+                    size="sm"
+                    icon="la:trash"
+                    color="negative"
+                    :aria-label="t(`admin.groups.ruleDelete`)"
+                    @click="deleteRule(rule.id)">
+                    <w-tooltip>{{ t('admin.groups.ruleDelete') }}</w-tooltip>
+                  </w-btn>
+                </div>
+                <w-card class="admin-groups-rule-card mt-4" flat>
+                  <w-card-section
+                    class="admin-groups-rule-card-permissions"
+                    :class="getRuleModeClass(rule.mode)">
+                    <!--
+                      The permissions themselves, in the bar rather than behind a dropdown: a rule is
+                      read far more often than it is changed, and what it grants is the first thing a
+                      reader wants. Picking them is a dialog of its own (`RulePermissionsDialog`), which
+                      has room to lay them out by what the rule's pattern means to each.
+                    -->
+                    <div class="admin-groups-rule-roles">
+                      <w-chip
+                        v-for="perm of ruleRoleChips(rule)"
+                        :key="perm.permission"
+                        square
+                        dense
+                        :color="getRuleModeBgColor(rule.mode)"
+                        text-color="white">
+                        <span class="text-caption">{{ perm.title }}</span>
+                      </w-chip>
+                      <span v-if="rule.roles.length < 1" class="text-caption text-grey-6">
+                        {{ t('admin.groups.rulePermissionsNone') }}
+                      </span>
+                    </div>
+                    <w-btn
+                      v-if="canManage"
+                      class="admin-groups-rule-select acrylic-btn ml-4 shrink-0"
+                      flat
+                      no-caps
+                      :color="getRuleModeBgColor(rule.mode)"
+                      icon="la:list-alt"
+                      padding="xs md"
+                      :label="t(`admin.groups.rulePermissionsSelect`)"
+                      @click="selectRulePermissions(rule)" />
+                  </w-card-section>
+                  <w-card-section horizontal>
+                    <w-card-section class="admin-groups-rule-card-filters">
+                      <div class="text-caption">Applies to...</div>
+                      <w-select
+                        class="mt-1"
+                        standout
+                        v-model="rule.sites"
+                        emit-value
+                        map-options
+                        dense
+                        :disable="!canManage"
+                        :aria-label="t(`admin.groups.ruleSites`)"
+                        :options="adminStore.sites"
+                        option-value="id"
+                        option-label="title"
+                        multiple
+                        :display-value="
+                          t(`admin.groups.selectedSites`, rule.sites.length, {
+                            count: rule.sites.length
+                          })
+                        ">
+                      </w-select>
+                      <w-select
+                        class="mt-2"
+                        standout
+                        v-model="rule.locales"
+                        emit-value
+                        map-options
+                        dense
+                        :disable="!canManage"
+                        :aria-label="t(`admin.groups.ruleLocales`)"
+                        :options="adminStore.locales"
+                        option-value="code"
+                        option-label="name"
+                        multiple
+                        :display-value="
+                          t(
+                            `admin.groups.selectedLocales`,
+                            {
+                              n:
+                                rule.locales.length > 0
+                                  ? rule.locales[0].toUpperCase()
+                                  : rule.locales.length
+                            },
+                            rule.locales.length
+                          )
+                        ">
+                      </w-select>
+                    </w-card-section>
+                    <w-card-section class="admin-groups-rule-card-pattern">
+                      <div class="text-caption">Pattern</div>
+                      <w-select
+                        class="mt-1"
+                        standout
+                        v-model="rule.match"
+                        emit-value
+                        map-options
+                        dense
+                        :disable="!canManage"
+                        :aria-label="t(`admin.groups.ruleMatch`)"
+                        :options="[
+                          { label: t('admin.groups.ruleMatchStart'), value: 'START' },
+                          { label: t('admin.groups.ruleMatchEnd'), value: 'END' },
+                          { label: t('admin.groups.ruleMatchSubtree'), value: 'SUBTREE' },
+                          { label: t('admin.groups.ruleMatchRegex'), value: 'REGEX' },
+                          { label: t('admin.groups.ruleMatchTag'), value: 'TAG' },
+                          { label: t('admin.groups.ruleMatchTagAll'), value: 'TAGALL' },
+                          { label: t('admin.groups.ruleMatchExact'), value: 'EXACT' }
+                        ]" />
+                      <!--
+                        A tag rule matches on tags and a path rule on a path, so the field under the
+                        kind is whichever one that kind reads. They are separate properties of the
+                        rule rather than one field doing double duty: changing the kind and changing
+                        it back leaves both intact.
+                      -->
+                      <w-select
+                        v-if="isTagMatch(rule.match)"
+                        class="mt-2"
+                        standout
+                        v-model="rule.tags"
+                        :options="sortedTags"
+                        dense
+                        options-dense
+                        use-input
+                        use-chips
+                        create
+                        multiple
+                        hide-dropdown-icon
+                        :placeholder="t(`admin.groups.ruleTagsHint`)"
+                        :aria-label="t(`admin.groups.ruleTags`)"
+                        :disable="!canManage"
+                        :loading="state.isLoadingTags"
+                        @create="(val) => addRuleTags(rule, val)">
+                        <template #prepend><w-icon name="la:hashtag" size="xs" /></template>
+                      </w-select>
+                      <w-input
+                        v-else
+                        class="mt-2"
+                        standout
+                        v-model="rule.path"
+                        dense
+                        :prefix="
+                          [`START`, `SUBTREE`, `REGEX`, `EXACT`].includes(rule.match) ? `/` : null
+                        "
+                        :suffix="rule.match === `REGEX` ? `/` : null"
+                        :disable="!canManage"
+                        :aria-label="t(`admin.groups.rulePath`)" />
+                    </w-card-section>
+                  </w-card-section>
+                </w-card>
+              </div>
+            </w-card-section>
+          </w-card>
+        </div>
+      </w-page>
+      <!-- ----------------------------------------------------------------------- -->
+      <!-- PERMISSIONS -->
+      <!-- ----------------------------------------------------------------------- -->
+      <w-page v-else-if="route.params.section === `permissions`">
+        <div class="p-4">
+          <div class="grid grid-cols-12 gap-4">
+            <!--
+              One card per kind of question, rather than one list of ten: what an account gets for
+              being let into the admin area at all, what runs a site, what runs the people. The row
+              inside them is the same everywhere, so it is written once and the cards are data --
+              see `permissionCards`.
+            -->
+            <div class="col-span-12 lg:col-span-6">
+              <w-card
+                v-for="(card, cardIdx) of leftPermissionCards"
+                :key="card.key"
+                class="shadow-1 pb-2"
+                :class="{ 'mt-4': cardIdx > 0 }">
+                <w-card-header>
+                  {{ t(card.title) }}
+                  <template #action>
+                    <w-btn
+                      class="acrylic-btn"
+                      icon="la:question-circle"
+                      flat
+                      color="grey"
+                      type="a"
+                      :href="siteStore.docsBase + card.docs"
+                      target="_blank"
+                      :aria-label="t(`common.actions.viewDocs`)">
+                      <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+                    </w-btn>
+                  </template>
+                </w-card-header>
+                <template v-for="(perm, idx) of card.permissions" :key="perm.permission">
+                  <w-item tag="label">
+                    <w-item-section class="items-center" style="flex: 0 0 40px">
+                      <w-icon :name="card.icon" color="primary" size="sm" />
+                    </w-item-section>
+                    <w-item-section>
+                      <w-item-label>{{ perm.permission }}</w-item-label>
+                      <w-item-label caption>{{ perm.hint }}</w-item-label>
+                    </w-item-section>
+                    <w-item-section avatar>
+                      <w-toggle
+                        v-model="state.group.permissions"
+                        :val="perm.permission"
+                        color="primary"
+                        checked-icon="la:check"
+                        unchecked-icon="la:times"
+                        :disable="
+                          isSystemPermissionLocked(perm.permission) || !canManagePermissions
+                        "
+                        :aria-label="perm.permission" />
+                    </w-item-section>
+                  </w-item>
+                  <w-separator class="my-2" inset v-if="idx < card.permissions.length - 1" />
+                </template>
+              </w-card>
+            </div>
+            <div class="col-span-12 lg:col-span-6">
+              <w-card
+                v-for="card of rightPermissionCards"
+                :key="card.key"
+                class="shadow-1 mb-4 pb-2">
+                <w-card-header>
+                  {{ t(card.title) }}
+                  <template #action>
+                    <w-btn
+                      class="acrylic-btn"
+                      icon="la:question-circle"
+                      flat
+                      color="grey"
+                      type="a"
+                      :href="siteStore.docsBase + card.docs"
+                      target="_blank"
+                      :aria-label="t(`common.actions.viewDocs`)">
+                      <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+                    </w-btn>
+                  </template>
+                </w-card-header>
+                <template v-for="(perm, idx) of card.permissions" :key="perm.permission">
+                  <w-item tag="label">
+                    <w-item-section class="items-center" style="flex: 0 0 40px">
+                      <w-icon :name="card.icon" color="primary" size="sm" />
+                    </w-item-section>
+                    <w-item-section>
+                      <w-item-label>{{ perm.permission }}</w-item-label>
+                      <w-item-label caption>{{ perm.hint }}</w-item-label>
+                    </w-item-section>
+                    <w-item-section avatar>
+                      <w-toggle
+                        v-model="state.group.permissions"
+                        :val="perm.permission"
+                        color="primary"
+                        checked-icon="la:check"
+                        unchecked-icon="la:times"
+                        :disable="
+                          isSystemPermissionLocked(perm.permission) || !canManagePermissions
+                        "
+                        :aria-label="perm.permission" />
+                    </w-item-section>
+                  </w-item>
+                  <w-separator class="my-2" inset v-if="idx < card.permissions.length - 1" />
+                </template>
+              </w-card>
+              <!--
+                `manage:system` on a card of its own, because it is not one more thing a group may
+                do: the server checks it FIRST and lets the request through whatever the cards beside
+                it say, so ticking it makes every other toggle on this screen moot. A row in any of
+                those lists would have read as one more item in it.
+              -->
+              <w-card class="shadow-1 pb-2">
+                <w-card-header>
+                  {{ t(`admin.groups.systemPermission`) }}
+                  <template #action>
+                    <w-btn
+                      class="acrylic-btn"
+                      icon="la:question-circle"
+                      flat
+                      color="grey"
+                      type="a"
+                      :href="siteStore.docsBase + `/admin/permissions#full-access`"
+                      target="_blank"
+                      :aria-label="t(`common.actions.viewDocs`)">
+                      <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+                    </w-btn>
+                  </template>
+                </w-card-header>
+                <w-item tag="label">
+                  <w-item-section class="items-center" style="flex: 0 0 40px">
+                    <w-icon name="la:fire-alt" color="negative" size="sm" />
+                  </w-item-section>
+                  <w-item-section>
+                    <w-item-label>{{ systemPermission.permission }}</w-item-label>
+                    <w-item-label caption>{{ systemPermission.hint }}</w-item-label>
+                  </w-item-section>
+                  <w-item-section avatar>
+                    <!--
+                      No `color` or glyph overrides: WToggle says in its own header that the switch
+                      reads the same everywhere and that a toggle needing to signal danger should say
+                      so in its label. The card, the red mark beside it and the banner below are what
+                      say so here.
+                    -->
+                    <w-toggle
+                      v-model="state.group.permissions"
+                      :val="systemPermission.permission"
+                      :disable="
+                        isSystemPermissionLocked(systemPermission.permission) ||
+                        !canManagePermissions
+                      "
+                      :aria-label="systemPermission.permission" />
+                  </w-item-section>
+                </w-item>
+                <w-card-section>
+                  <!--
+                      A pale red panel on a light card and a TINT of the same red on a dark one, the
+                      way the dark surfaces elsewhere in the app are built: filling it solid read as
+                      an error that had happened rather than a caution about what is being granted.
+                    -->
+                  <w-banner class="bg-red-1 text-red-9 dark:bg-red-9/30 dark:text-red-2" dense>
+                    <template #avatar>
+                      <w-icon name="la:exclamation-triangle" color="negative" size="sm" />
+                    </template>
+                    <div class="font-semibold">{{ t('admin.groups.systemPermissionWarn') }}</div>
+                    <div class="mt-1 text-xs opacity-90">
+                      {{ t('admin.groups.systemPermissionWarnHint') }}
+                    </div>
+                  </w-banner>
+                </w-card-section>
+              </w-card>
+            </div>
+          </div>
+        </div>
+      </w-page>
+      <!-- ----------------------------------------------------------------------- -->
+      <!-- USERS -->
+      <!-- ----------------------------------------------------------------------- -->
+      <w-page v-else-if="route.params.section === `users`">
+        <w-toolbar :class="dark.isActive ? `bg-dark-3 text-white` : `bg-white text-dark`">
+          <div class="text-subtitle1">{{ t('admin.groups.users') }}</div>
+          <w-space />
+          <w-btn
+            class="acrylic-btn mr-2"
+            icon="la:question-circle"
+            flat
+            color="grey"
+            type="a"
+            :href="siteStore.docsBase + `/admin/groups#users`"
+            target="_blank"
+            :aria-label="t(`common.actions.viewDocs`)">
+            <w-tooltip>{{ t(`common.actions.viewDocs`) }}</w-tooltip>
+          </w-btn>
+          <w-input
+            class="denser fill-outline mr-2"
+            outlined
+            v-model="state.usersFilter"
+            :placeholder="t(`admin.groups.filterUsers`)"
+            dense>
+            <template #prepend><w-icon name="la:search" /></template>
+          </w-input>
+          <w-btn
+            class="mr-2 acrylic-btn"
+            icon="la:redo-alt"
+            flat
+            color="secondary"
+            @click="refreshUsers" />
+          <w-btn
+            class="mr-1"
+            unelevated
+            icon="la:user-plus"
+            :label="t(`admin.groups.assignUser`)"
+            color="primary"
+            v-if="canManage"
+            @click="assignUser" />
+        </w-toolbar>
+        <w-separator />
+        <div class="p-4">
+          <w-banner
+            v-if="!state.users || state.users.length < 1"
+            rounded
+            :class="dark.isActive ? `bg-negative text-white` : `bg-grey-4 text-grey-9`"
+            >{{ t('admin.groups.usersNone') }}</w-banner
+          >
+          <w-card class="shadow-1">
+            <w-table
+              :rows="state.users"
+              :columns="usersHeaders"
+              row-key="id"
+              flat
+              hide-header
+              :loading="state.isLoadingUsers">
+              <template #body-cell-id="props">
+                <w-td :props="props"><w-icon name="la:user" color="primary" size="sm" /></w-td>
+              </template>
+              <template #body-cell-name="props">
+                <w-td :props="props">
+                  <div class="flex items-center">
+                    <strong>{{ props.value }}</strong>
+                    <w-icon class="ml-2" v-if="props.row.isSystem" name="la:lock" color="pink" />
+                    <w-icon class="ml-2" v-if="!props.row.isActive" name="la:ban" color="pink" />
+                  </div>
+                </w-td>
+              </template>
+              <template #body-cell-email="props">
+                <w-td :props="props"
+                  ><em>{{ props.value }}</em></w-td
+                >
+              </template>
+              <template #body-cell-date="props">
+                <w-td :props="props">
+                  <i18n-t class="text-caption" keypath="admin.users.createdAt" tag="div">
+                    <template #date
+                      ><strong>{{ humanizeDate(props.value) }}</strong></template
+                    >
+                  </i18n-t>
+                  <i18n-t
+                    class="text-caption"
+                    v-if="props.row.lastLoginAt"
+                    keypath="admin.users.lastLoginAt"
+                    tag="div">
+                    <template #date>
+                      <strong>{{ humanizeDate(props.row.lastLoginAt) }}</strong>
+                    </template>
+                  </i18n-t>
+                </w-td>
+              </template>
+              <template #body-cell-edit="props">
+                <w-td :props="props">
+                  <w-btn
+                    class="acrylic-btn mr-2"
+                    v-if="!props.row.isSystem"
+                    flat
+                    :to="`/_admin/users/` + props.row.id"
+                    icon="la:pen"
+                    :color="dark.isActive ? `indigo-4` : `indigo`"
+                    :label="t(`common.actions.edit`)"
+                    no-caps />
+                  <!-- Hidden for system users: the guest account's membership is fixed, and the API -->
+                  <!-- refuses to change it either way -->
+                  <w-btn
+                    class="acrylic-btn"
+                    v-if="!props.row.isSystem && canManage"
+                    flat
+                    icon="la:user-minus"
+                    color="accent"
+                    :aria-label="t(`admin.groups.unassignUser`)"
+                    @click="unassignUser(props.row)">
+                    <w-tooltip anchor="center left" self="center right">{{
+                      t('admin.groups.unassignUser')
+                    }}</w-tooltip>
+                  </w-btn>
+                </w-td>
+              </template>
+            </w-table>
+          </w-card>
+          <div class="flex items-center justify-center mt-4" v-if="usersTotalPages > 1">
+            <w-pagination
+              v-model="state.usersPage"
+              :max="usersTotalPages"
+              :max-pages="9"
+              boundary-numbers
+              direction-links />
+          </div>
+        </div>
+      </w-page>
+    </w-page-container>
+  </w-layout>
+</template>
+
+<script setup>
+import { useI18n } from 'vue-i18n'
+import { computed, onMounted, reactive, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
+
+import { confirm, dialog } from '@/composables/dialog'
+import { useDark } from '@/composables/dark'
+import { notify } from '@/composables/notify'
+
+import { useAdminStore } from '@/stores/admin'
+import { useSiteStore } from '@/stores/site'
+import { useUserStore } from '@/stores/user'
+
+import { v4 as uuid } from 'uuid'
+import { fileOpen, fileSave } from 'browser-fs-access'
+import RuleModeMenu from '@/components/RuleModeMenu.vue'
+import RulePermissionsDialog from '@/components/RulePermissionsDialog.vue'
+import UserSearchDialog from '@/components/UserSearchDialog.vue'
+import { apiErrorMessage } from '@/helpers/apiError'
+import { isRedirectTarget } from '@/helpers/loginRedirect'
+
+// COMPOSABLES
+
+const dark = useDark()
+
+// STORES
+
+const adminStore = useAdminStore()
+const siteStore = useSiteStore()
+const userStore = useUserStore()
+
+// ROUTER
+
+const router = useRouter()
+const route = useRoute()
+
+// I18N
+
+const { t } = useI18n()
+
+// DATA
+
+const state = reactive({
+  group: {
+    rules: []
+  },
+  isLoading: false,
+  /** Every tag in use on the instance, as suggestions for the tag rules. */
+  tags: [],
+  isLoadingTags: false,
+  users: [],
+  isLoadingUsers: false,
+  usersFilter: '',
+  usersPage: 1,
+  usersPageSize: 15,
+  usersTotal: 0
+})
+
+/*
+  Computed, not plain arrays: the locale strings are fetched after the app mounts (`App.vue` ->
+  `applyLocale`), so a `t()` called once during `setup()` can resolve before they land and leave
+  the tab strip and the member table showing raw keys for the life of the page — which is what a direct load of this
+  screen does, as opposed to a navigation to it. Inside a computed they re-evaluate when
+  `setLocaleMessage` fills the strings in.
+*/
+const sections = computed(() => [
+  { key: 'overview', text: t('admin.groups.overview'), icon: 'la:users' },
+  { key: 'rules', text: t('admin.groups.rules'), icon: 'la:file-invoice', rulesTotal: true },
+  {
+    key: 'permissions',
+    text: t('admin.groups.permissions'),
+    icon: 'la:list-alt',
+    excludeGuests: true
+  },
+  {
+    key: 'users',
+    text: t('admin.groups.users'),
+    icon: 'la:user',
+    usersTotal: true,
+    excludeGuests: true
+  }
+])
+
+const usersHeaders = computed(() => [
+  {
+    align: 'center',
+    field: 'id',
+    name: 'id',
+    sortable: false,
+    style: 'width: 20px'
+  },
+  {
+    label: t('common.field.name'),
+    align: 'left',
+    field: 'name',
+    name: 'name',
+    sortable: true
+  },
+  {
+    label: t('admin.users.email'),
+    align: 'left',
+    field: 'email',
+    name: 'email',
+    sortable: false
+  },
+  {
+    align: 'left',
+    field: 'createdAt',
+    name: 'date',
+    sortable: false
+  },
+  {
+    label: '',
+    align: 'right',
+    field: 'edit',
+    name: 'edit',
+    sortable: false,
+    style: 'width: 250px'
+  }
+])
+
+/**
+ * The group-wide permissions, as cards, in the order the screen offers them.
+ *
+ * Grouped by what they are ABOUT rather than listed flat: what getting into the admin area buys on
+ * its own, what runs a site, and what runs the people. A flat list of ten made a reader work out for
+ * themselves that `manage:theme` and `manage:groups` answer completely different questions.
+ *
+ * `column` is which half of the screen a card sits in; `icon` is the mark every row in it wears, so
+ * that a permission is recognisable as belonging to its group at a glance rather than by reading the
+ * heading above it; `docs` is the fragment its help button links to, since each card answers to its
+ * own section of the documentation rather than to one page for the whole screen. `manage:system` is deliberately in
+ * neither list — it is not one more entry but the absence of the list, so it has a card of its own.
+ * See `systemPermission`.
+ */
+const permissionCards = [
+  {
+    key: 'general',
+    docs: '/admin/permissions#global-permissions',
+    icon: 'la:snowflake',
+    column: 'left',
+    title: 'admin.groups.permissionsGeneral',
+    permissions: [
+      {
+        permission: 'access:admin',
+        hint: 'Can access the administration and view the dashboard. Cannot perform any other action unless other permissions are also granted.'
+      },
+      {
+        permission: 'read:audit',
+        hint: 'Can read the audit log, i.e. the record of what everybody on this wiki has done.'
+      },
+      {
+        permission: 'read:metrics',
+        hint: 'Can scrape the Prometheus metrics endpoint from an address it is not open to anonymously.'
+      }
+    ]
+  },
+  {
+    key: 'site',
+    docs: '/admin/permissions#site-management-matrix',
+    icon: 'la:landmark',
+    column: 'left',
+    title: 'admin.groups.permissionsSite',
+    permissions: [
+      {
+        permission: 'manage:sites',
+        hint: 'Can create / manage sites and their settings: general, analytics, approvals, comments, content blocks, editors, locale and login. Theme and storage are separate permissions.'
+      },
+      {
+        permission: 'manage:theme',
+        hint: 'Can modify site theme settings, including the CSS, head and body injected into every page. This is the only permission that can.'
+      },
+      {
+        permission: 'manage:storage',
+        hint: "Can modify site storage settings: which targets hold this site's content, where it is served from, and the actions that move it. This is the only permission that can."
+      }
+    ]
+  },
+  {
+    key: 'webhooks',
+    docs: '/admin/permissions#site-management-matrix',
+    icon: 'la:bolt',
+    column: 'left',
+    title: 'admin.groups.permissionsWebhooks',
+    permissions: [
+      {
+        permission: 'read:webhooks',
+        hint: 'Can view webhooks and their settings, but not create or modify them. The authorization header of each one reads as a mask rather than as its value.'
+      },
+      {
+        permission: 'manage:webhooks',
+        hint: 'Can view, create, modify and delete webhooks.'
+      }
+    ]
+  },
+  {
+    key: 'users',
+    docs: '/admin/permissions#user-management-matrix',
+    icon: 'la:user-tie',
+    column: 'right',
+    title: 'admin.groups.permissionsUsers',
+    permissions: [
+      {
+        permission: 'read:users',
+        hint: 'Can view users, but not create or modify them.'
+      },
+      {
+        permission: 'write:users',
+        hint: 'Can create new users, but not modify existing ones. A new user can only be placed in groups that do not administer the wiki.'
+      },
+      {
+        permission: 'manage:users',
+        hint: 'Can create and modify users, except those in a group with manage:system. Cannot move a user in or out of a group that administers the wiki.'
+      },
+      {
+        permission: 'read:groups',
+        hint: 'Can view groups and their permissions, but not create or modify them.'
+      },
+      {
+        permission: 'write:groups',
+        hint: 'Can create and manage groups and their page rules, but cannot change what a group is allowed to do, delete one, or change the membership of a group that administers the wiki.'
+      },
+      {
+        permission: 'manage:groups',
+        hint: 'Can create / manage groups and assign permissions (but not manage:system) / page rules'
+      },
+      {
+        permission: 'manage:scim',
+        hint: 'Can drive SCIM provisioning at /_scim/v2: create and deactivate accounts, and set the membership of groups that do not administer the wiki. Meant for an API key issued to an identity provider, not for a person.'
+      }
+    ]
+  }
+]
+
+const leftPermissionCards = permissionCards.filter((c) => c.column === 'left')
+const rightPermissionCards = permissionCards.filter((c) => c.column === 'right')
+
+const systemPermission = {
+  permission: 'manage:system',
+  hint: 'Can manage and access everything. Root administrator.'
+}
+
+/**
+ * The subset of `rules` below that the guests group may be granted. Mirrors `GUEST_ROLES` in
+ * `models/groups.ts`, which is the copy that decides — this one only shapes what is offered.
+ */
+const GUEST_ROLES = [
+  'read:pages',
+  'read:source',
+  'read:history',
+  'read:assets',
+  'read:comments',
+  'write:comments',
+  'read:glossary'
+]
+
+const rules = [
+  {
+    permission: 'read:pages',
+    title: 'Read Pages',
+    hint: 'Can view and search pages.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'write:pages',
+    title: 'Write Pages',
+    hint: 'Can create and edit pages.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'review:pages',
+    title: 'Review Pages',
+    hint: 'Can review and approve edits submitted by users.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'manage:pages',
+    title: 'Manage Pages',
+    hint: 'Can move existing pages to other locations the user has write access to.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'delete:pages',
+    title: 'Delete Pages',
+    hint: 'Can delete existing pages and restore them from the recycle bin.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'write:tags',
+    title: 'Assign Tags',
+    hint: 'Can assign and unassign tags on pages.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'write:styles',
+    title: 'Use CSS',
+    hint: 'Can insert CSS styles in pages.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'write:scripts',
+    title: 'Use JavaScript',
+    hint: 'Can insert JavaScript in pages.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'read:source',
+    title: 'View Page Source',
+    hint: 'Can view pages source.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'read:history',
+    title: 'View Page History',
+    hint: 'Can view previous versions of pages.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'manage:navigation',
+    title: 'Manage Navigation',
+    hint: 'Can change how pages here resolve their sidebar, and edit the menu itself where this rule also covers the page the menu belongs to.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'read:assets',
+    title: 'View Assets',
+    hint: 'Can view / use assets (such as images and files) in pages.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'write:assets',
+    title: 'Upload Assets',
+    hint: 'Can upload new assets (such as images and files).',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'manage:assets',
+    title: 'Manage Assets',
+    hint: 'Can edit and delete existing assets (such as images and files).',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  {
+    permission: 'read:comments',
+    title: 'Read Comments',
+    hint: 'Can view page comments.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'write:comments',
+    title: 'Write Comments',
+    hint: 'Can post new comments on pages.',
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'manage:comments',
+    title: 'Manage Comments',
+    hint: 'Can edit and delete existing page comments.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  },
+  /*
+    The two rule permissions that ignore the path: a glossary belongs to a site and a locale, so every
+    rule naming one that is scoped to them applies, and mode alone decides -- see `resolveLocaleRule`
+    in `helpers/pageRules.ts`. The hints say so, because a DENY written for one folder closing the
+    whole glossary is not what anybody would guess. `scope: 'locale'` is what puts them in the
+    picker's second column (`RulePermissionsDialog`), whose heading carries that warning for both,
+    and has to match `LOCALE_PERMISSIONS` in `models/groups.ts`.
+  */
+  {
+    permission: 'read:glossary',
+    scope: 'locale',
+    title: 'Read Glossary',
+    hint: "Can view the site's glossary.",
+    warning: false,
+    restrictedForSystem: false,
+    disabled: false
+  },
+  {
+    permission: 'manage:glossary',
+    scope: 'locale',
+    title: 'Manage Glossary',
+    hint: 'Can create, edit and delete glossary terms, and view them.',
+    warning: false,
+    restrictedForSystem: true,
+    disabled: false
+  }
+]
+
+// VALIDATION RULES
+
+const groupNameValidation = [(val) => /^[^<>"]+$/.test(val) || t('admin.groups.nameInvalidChars')]
+
+// COMPUTED
+
+/*
+  `read:groups` opens this overlay read-only: saving a group, and assigning a user to one, need
+  `manage:groups` / `write:groups` (see `api/groups.ts`), so the actions that perform one are hidden
+  rather than left to fail at the API. Exporting rules stays -- it only reads what is on screen.
+*/
+const canManage = computed(() => userStore.can('manage:groups') || userStore.can('write:groups'))
+
+/** The three redirect fields: empty defers to the site, anything else must be somewhere to go. */
+const redirectRules = [(val) => !val || isRedirectTarget(val) || t('admin.groups.redirectInvalid')]
+
+/*
+  Whether this user may rewrite what the group is ALLOWED to do, which is the Permissions tab and
+  nothing else. `write:groups` builds and arranges groups -- names, page rules, redirects, who is in
+  the ordinary ones -- but granting a group `manage:users` is a way of granting oneself anything, so
+  the global list stays with `manage:groups`. The tab is still shown, because reading what a group
+  may do is the point of being able to open it.
+*/
+const canManagePermissions = computed(() => userStore.can('manage:groups'))
+
+/*
+  `manage:system` is the one permission a `manage:groups` holder may not move: granting it hands over
+  the instance, revoking it locks the real administrators out. `api/groups.ts` refuses the change
+  either way, so the toggle is held rather than left to fail on save -- every OTHER permission on such
+  a group stays editable, which is why this is per-permission and not a read-only group.
+*/
+function isSystemPermissionLocked(permission) {
+  return permission === 'manage:system' && !userStore.can('manage:system')
+}
+
+const usersTotalPages = computed(() => {
+  if (state.usersTotal < 1) {
+    return 0
+  }
+  return Math.ceil(state.usersTotal / state.usersPageSize)
+})
+
+const isGuestGroup = computed(() => {
+  return adminStore.overlayOpts.id === '10000000-0000-4000-8000-000000000001'
+})
+
+/**
+ * The permissions a rule may grant, which for the guests group is a short list.
+ *
+ * That group is every anonymous reader at once, so a rule on it is a rule about the open internet:
+ * reading, and saying something in a comment, are what the public may be given — writing a page or
+ * deleting one is an action attributable to somebody, and there is nobody here.
+ *
+ * Only what is OFFERED. The set is enforced in `models/groups.ts`, which is what makes it true for a
+ * group edited through the API as well; this keeps the screen from offering what would be dropped.
+ */
+const ruleOptions = computed(() =>
+  isGuestGroup.value ? rules.filter((rule) => GUEST_ROLES.includes(rule.permission)) : rules
+)
+
+/**
+ * The tag suggestions in the order they are offered: alphabetical.
+ *
+ * `GET /tags` answers most-used first, which is the right order for a limit and the wrong one for a
+ * list to pick from -- WSelect narrows it as you type but never reorders it. `localeCompare`, since
+ * tags are page-authored words in whatever language the wiki is written in.
+ */
+const sortedTags = computed(() => [...state.tags].sort((a, b) => a.localeCompare(b)))
+
+// WATCHERS
+
+watch(() => route.params.section, checkRoute)
+watch([() => state.usersPage, () => state.usersFilter], refreshUsers)
+
+// METHODS
+
+function close() {
+  adminStore.$patch({ overlay: '' })
+}
+
+function checkRoute() {
+  if (!route.params.section) {
+    router.replace({ params: { section: 'overview' } })
+  } else if (route.params.section === 'users') {
+    refreshUsers()
+  }
+}
+
+function humanizeDate(val) {
+  if (!val) {
+    return '---'
+  }
+  return Temporal.Instant.from(val).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short'
+  })
+}
+
+function getRuleModeColor(mode) {
+  return {
+    DENY: 'text-negative',
+    ALLOW: 'text-positive',
+    FORCEALLOW: 'text-blue'
+  }[mode]
+}
+
+function getRuleModeBgColor(mode) {
+  return {
+    DENY: 'negative',
+    ALLOW: 'positive',
+    FORCEALLOW: 'blue'
+  }[mode]
+}
+
+function getRuleModeClass(mode) {
+  return 'is-' + mode.toLowerCase()
+}
+
+function getRuleModeIcon(mode) {
+  return (
+    {
+      DENY: 'la:ban',
+      ALLOW: 'la:check',
+      FORCEALLOW: 'la:check-double'
+    }[mode] || 'la:frog'
+  )
+}
+
+function getRuleModeName(mode) {
+  switch (mode) {
+    case 'ALLOW':
+      return t('admin.groups.ruleAllow')
+    case 'DENY':
+      return t('admin.groups.ruleDeny')
+    case 'FORCEALLOW':
+      return t('admin.groups.ruleForceAllow')
+    default:
+      return '???'
+  }
+}
+
+function refresh() {
+  fetchGroup()
+}
+
+async function fetchGroup() {
+  state.isLoading = true
+  try {
+    const resp = await API_CLIENT.get(`groups/${adminStore.overlayOpts.id}`).json()
+    if (!resp?.id) {
+      throw new Error('An unexpected error occured while fetching group details.')
+    }
+    // -> `tags` is optional in the API's rule schema, so a rule written through it may arrive without
+    //    one; the field below binds to an array either way
+    state.group = {
+      ...resp,
+      rules: (resp.rules ?? []).map((r) => ({ ...r, tags: r.tags ?? [] }))
+    }
+    state.usersTotal = state.group.userCount ?? 0
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: err.message
+    })
+  }
+  state.isLoading = false
+}
+
+async function save() {
+  state.isLoading = true
+  try {
+    const resp = await API_CLIENT.put(`groups/${state.group.id}`, {
+      json: {
+        name: state.group.name,
+        redirectOnLogin: state.group.redirectOnLogin ?? '',
+        redirectOnFirstLogin: state.group.redirectOnFirstLogin ?? '',
+        redirectOnLogout: state.group.redirectOnLogout ?? '',
+        permissions: state.group.permissions ?? [],
+        rules: state.group.rules ?? []
+      }
+    }).json()
+    if (!resp?.ok) {
+      throw new Error(
+        t(`admin.groups.${resp?.error}`, resp?.message || 'An unexpected error occured.')
+      )
+    }
+    notify({
+      type: 'positive',
+      message: t('admin.groups.saveSuccess')
+    })
+  } catch (err) {
+    // -> ky throws above 400 with the reason in the body, which is where the server explains itself
+    notify({
+      type: 'negative',
+      message: apiErrorMessage(err, 'An unexpected error occured.')
+    })
+  }
+  state.isLoading = false
+}
+
+/** Whether a rule kind addresses pages by tag, which is what decides the field offered under it. */
+function isTagMatch(match) {
+  return match === 'TAG' || match === 'TAGALL'
+}
+
+/**
+ * Add whatever was typed to a rule, as one tag or as several.
+ *
+ * A comma or a semicolon separates them, so a list can be pasted in one go -- the same as the page
+ * properties panel. A tag that is on no page is perfectly valid here: a rule may be written ahead of
+ * the content it is about, and one that names a tag nobody has used yet simply matches nothing until
+ * somebody does. It does NOT join the suggestions, which are the tags actually in use: a tag exists
+ * because a page carries it, and offering one invented in this field would say otherwise.
+ */
+function addRuleTags(rule, val) {
+  const tags = val
+    .split(/[,;]+/)
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean)
+  rule.tags = [...new Set([...(rule.tags ?? []), ...tags])]
+}
+
+async function fetchTags() {
+  state.isLoadingTags = true
+  try {
+    const resp = await API_CLIENT.get('tags').json()
+    state.tags = (resp ?? []).map((tg) => tg.tag)
+  } catch (err) {
+    // -> Suggestions are a convenience: a tag can still be typed in without them, so this is a
+    //    warning rather than a failure
+    notify({
+      type: 'warning',
+      message: t('admin.groups.ruleTagsFailed'),
+      caption: apiErrorMessage(err)
+    })
+  }
+  state.isLoadingTags = false
+}
+
+function newRule() {
+  state.group.rules.push({
+    id: uuid(),
+    name: t('admin.groups.ruleUntitled'),
+    mode: 'ALLOW',
+    match: 'START',
+    roles: [],
+    path: '',
+    tags: [],
+    locales: [],
+    sites: []
+  })
+}
+
+/*
+  Set what a rule does. Guarded here as well as by the disabled triggers, since the menu is the only
+  thing between a reader holding `read:groups` and re-pointing a rule.
+*/
+function setRuleMode(rule, mode) {
+  if (!canManage.value) {
+    return
+  }
+  rule.mode = mode
+}
+
+/**
+ * A rule's permissions as the bar draws them: in the order the picker offers them, with anything the
+ * rule names that is not on offer (an imported rule may) shown under its raw name at the end.
+ */
+function ruleRoleChips(rule) {
+  const roles = new Set(rule.roles)
+  const known = rules.filter((opt) => roles.has(opt.permission))
+  const unknown = rule.roles
+    .filter((role) => !rules.some((opt) => opt.permission === role))
+    .map((role) => ({ permission: role, title: role }))
+  return [...known, ...unknown]
+}
+
+function selectRulePermissions(rule) {
+  dialog({
+    component: RulePermissionsDialog,
+    componentProps: {
+      options: ruleOptions.value,
+      selected: rule.roles
+    }
+  }).onOk((roles) => {
+    rule.roles = roles
+  })
+}
+
+function deleteRule(id) {
+  state.group.rules = state.group.rules.filter((r) => r.id !== id)
+}
+
+function exportRules() {
+  if (state.group.rules.length < 1) {
+    return notify({
+      type: 'negative',
+      message: t('admin.groups.exportRulesNoneError')
+    })
+  }
+  const rules = state.group.rules.map(({ __typename, ...r }) => r)
+  fileSave(new Blob([JSON.stringify(rules, null, 2)], { type: 'application/json;charset=UTF-8' }), {
+    fileName: 'rules.json',
+    extensions: ['.json']
+  })
+}
+
+async function importRules() {
+  try {
+    const blob = await fileOpen({
+      mimeTypes: ['application/json'],
+      extensions: ['.json'],
+      startIn: 'downloads',
+      excludeAcceptAllOption: true
+    })
+    const rulesRaw = await blob.text()
+    const rules = JSON.parse(rulesRaw)
+    if (!Array.isArray(rules) || rules.length < 1) {
+      throw new Error('Invalid Rules Format')
+    }
+    confirm({
+      title: t('admin.groups.importModeTitle'),
+      message: t('admin.groups.importModeText'),
+      options: {
+        model: 'replace',
+        type: 'radio',
+        items: [
+          { label: t('admin.groups.importModeReplace'), value: 'replace' },
+          { label: t('admin.groups.importModeAdd'), value: 'add' }
+        ]
+      },
+      persistent: true
+    }).onOk((choice) => {
+      if (choice === 'replace') {
+        state.group.rules = []
+      }
+      state.group.rules = [
+        ...state.group.rules,
+        ...rules.map((r) => ({
+          id: uuid(),
+          name: r.name || t('admin.groups.ruleUntitled'),
+          mode: ['ALLOW', 'DENY', 'FORCEALLOW'].includes(r.mode) ? r.mode : 'DENY',
+          match: ['START', 'END', 'SUBTREE', 'REGEX', 'TAG', 'TAGALL', 'EXACT'].includes(r.match)
+            ? r.match
+            : 'START',
+          roles: r.roles || [],
+          path: r.path || '',
+          tags: Array.isArray(r.tags) ? r.tags.map((tg) => `${tg}`.trim().toLowerCase()) : [],
+          locales: r.locales.filter((l) => adminStore.locales.some((loc) => loc.code === l)),
+          sites: r.sites.filter((s) => adminStore.sites.some((site) => site.id === s))
+        }))
+      ]
+      notify({
+        type: 'positive',
+        message: t('admin.groups.importSuccess')
+      })
+    })
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: t('admin.groups.importFailed') + ` [${err.message}]`
+    })
+  }
+}
+
+async function refreshUsers() {
+  state.isLoadingUsers = true
+  try {
+    const resp = await API_CLIENT.get(`groups/${adminStore.overlayOpts.id}/users`, {
+      searchParams: {
+        ...(state.usersFilter ? { filter: state.usersFilter } : {}),
+        page: state.usersPage,
+        limit: state.usersPageSize
+      }
+    }).json()
+    if (!Array.isArray(resp?.users)) {
+      throw new Error('An unexpected error occured while fetching group users.')
+    }
+    state.usersTotal = resp.total ?? 0
+    state.users = resp.users
+  } catch (err) {
+    notify({
+      type: 'negative',
+      message: err.message
+    })
+  }
+  state.isLoadingUsers = false
+}
+
+function assignUser() {
+  dialog({
+    component: UserSearchDialog,
+    componentProps: {
+      title: t('admin.groups.assignUserTitle'),
+      // -> Only offer users the API would actually accept: not already members, not system users
+      assignableToGroupId: state.group.id
+    }
+  }).onOk(async (users) => {
+    state.isLoadingUsers = true
+    // -> Assignment is one user per request, so a failure partway through still leaves the
+    //    successful ones assigned; report both sides rather than a single all-or-nothing message.
+    let assigned = 0
+    for (const usr of users) {
+      try {
+        const resp = await API_CLIENT.post(`groups/${state.group.id}/users/${usr.id}`).json()
+        if (!resp?.ok) {
+          throw new Error(resp?.message || 'An unexpected error occured.')
+        }
+        assigned++
+      } catch (err) {
+        // -> ky throws above 400, with the reason in the body
+        notify({
+          type: 'negative',
+          message: t('admin.groups.assignUserFailed', { userName: usr.name }),
+          caption: apiErrorMessage(err)
+        })
+      }
+    }
+    if (assigned > 0) {
+      notify({
+        type: 'positive',
+        message: t('admin.groups.assignUserSuccess', { count: assigned })
+      })
+    }
+    await refreshUsers()
+  })
+}
+
+async function unassignUser(user) {
+  confirm({
+    title: t('admin.groups.unassignUser'),
+    message: t('admin.groups.unassignUserConfirm', { userName: user.name }),
+    cancel: true,
+    persistent: true
+  }).onOk(async () => {
+    state.isLoadingUsers = true
+    try {
+      const resp = await API_CLIENT.delete(`groups/${state.group.id}/users/${user.id}`)
+      if (!resp?.ok) {
+        throw new Error((await resp.json())?.message || 'An unexpected error occured.')
+      }
+      notify({
+        type: 'positive',
+        message: t('admin.groups.unassignUserSuccess')
+      })
+      await refreshUsers()
+    } catch (err) {
+      // -> ky throws above 400 (e.g. 409 for the last root admin), with the reason in the body
+      notify({
+        type: 'negative',
+        message: apiErrorMessage(err)
+      })
+    }
+    state.isLoadingUsers = false
+  })
+}
+
+// MOUNTED
+
+onMounted(() => {
+  checkRoute()
+  fetchGroup()
+  fetchTags()
+})
+</script>
+
+<style lang="scss">
+.admin-groups-rule {
+  position: relative;
+  padding: 10px 0 24px 40px;
+
+  /* -> Drawing only, under the mode button's disc: it must never take the click meant for it */
+  &-icon {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 31px;
+    pointer-events: none;
+
+    &::after {
+      position: absolute;
+      content: '';
+      width: 3px;
+      top: 41px;
+      bottom: 0;
+      left: 14px;
+      opacity: 0.4;
+      background-color: currentColor;
+      display: block;
+    }
+  }
+
+  /*
+    The mode: disc, name and caret as one button, in the rule's colour (`currentColor` throughout, from
+    the `text-*` class the template sets).
+
+    It sits in the title row but has to put its disc where the timeline starts, at the rule's left
+    edge and 4px down: hence the negative left margin over the row's 40px of padding, and the negative
+    vertical margins that let a 31px disc ride a 12px row without making it taller. The 9px gap is what
+    leaves the name where it always was, 40px in.
+  */
+  &-mode {
+    position: relative;
+    flex: 0 0 auto;
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    height: 31px;
+    margin: -9.5px 0 -9.5px -40px;
+    padding-right: 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      background-color: color-mix(in srgb, currentColor 12%, transparent);
+    }
+
+    &:focus-visible {
+      outline: 2px solid currentColor;
+      outline-offset: 2px;
+    }
+
+    &:disabled {
+      cursor: default;
+    }
+
+    &-disc {
+      display: inline-flex;
+      flex-shrink: 0;
+      align-items: center;
+      justify-content: center;
+      width: 31px;
+      height: 31px;
+      border-radius: 100%;
+      background-color: currentColor;
+
+      .w-icon {
+        width: 15px;
+        height: 15px;
+        color: #fff;
+      }
+    }
+
+    > .w-icon {
+      margin-left: -5px;
+    }
+  }
+
+  &-name {
+    line-height: 12px;
+    display: flex;
+    flex-wrap: nowrap;
+    /*
+      On the text baseline, not stretched. An <input> stretched to the row's height centres its text
+      inside that height, while the mode name beside it sits at the top of its own box -- so the two
+      read as a few pixels apart even though both are 12px type. The separator between them is
+      unaffected: it carries its own `self-stretch`, which outranks this.
+    */
+    align-items: baseline;
+    padding-top: 4px;
+
+    input {
+      font-weight: 700;
+      color: $grey-6;
+      letter-spacing: 1px;
+      font-size: 12px;
+      line-height: 12px;
+      border: none;
+      padding: 0 0 0 5px;
+      outline: none;
+      flex: 1;
+      background-color: transparent;
+
+      &::placeholder {
+        color: $grey-5;
+      }
+
+      @at-root .body--dark & {
+        color: rgba(255, 255, 255, 0.7);
+
+        &::placeholder {
+          color: rgba(255, 255, 255, 0.4);
+        }
+      }
+    }
+  }
+
+  /* -> At the end of the title row, level with the mode name and the rule's title */
+  &-delete {
+    align-self: center;
+    margin: -6px 0 -6px 0.5rem;
+  }
+
+  /* -> The chips wrap onto as many lines as the rule needs; the picker button keeps its place */
+  &-roles {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    min-height: 32px;
+  }
+
+  &-card {
+    background-color: $grey-2 !important;
+
+    @at-root .body--dark & {
+      background-color: $dark-6 !important;
+    }
+
+    &-permissions {
+      background-color: rgba($positive, 0.1);
+      border-bottom: 1px solid rgba($positive, 0.3);
+      display: flex;
+      align-items: center;
+
+      &.is-allow {
+        background-color: rgba($positive, 0.1);
+        border-bottom: 1px solid rgba($positive, 0.3);
+      }
+      &.is-deny {
+        background-color: rgba($negative, 0.1);
+        border-bottom: 1px solid rgba($negative, 0.3);
+      }
+      &.is-forceallow {
+        background-color: rgba($blue, 0.1);
+        border-bottom: 1px solid rgba($blue, 0.3);
+      }
+
+      /*
+        -> The mode's colour on its own pale bar is too light to read as text, in light mode: each one
+           darkened by the same amount rather than swapped for a deeper Material shade, which would be
+           another hue. `!important` because `WBtn` writes its colour as an inline style, which
+           nothing else outranks.
+      */
+      @at-root .body--light & .admin-groups-rule-select {
+        color: color-mix(in srgb, var(--rule-select-color) 65%, black) !important;
+      }
+      @at-root .body--light &.is-allow {
+        --rule-select-color: var(--color-positive);
+      }
+      @at-root .body--light &.is-deny {
+        --rule-select-color: var(--color-negative);
+      }
+      @at-root .body--light &.is-forceallow {
+        --rule-select-color: var(--color-blue);
+      }
+    }
+
+    &-filters {
+      background-color: $grey-3;
+      flex-basis: 300px;
+
+      .text-caption:first-child {
+        color: $grey-7;
+      }
+
+      @at-root .body--dark & {
+        background-color: $dark-5;
+      }
+    }
+    &-pattern {
+      flex-grow: 1;
+    }
+  }
+}
+</style>

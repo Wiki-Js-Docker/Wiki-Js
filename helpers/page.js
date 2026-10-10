@@ -1,0 +1,1253 @@
+import { defineStore } from 'pinia'
+
+import { pick } from 'es-toolkit/object'
+
+import { useSiteStore } from './site'
+import { useEditorStore } from './editor'
+import { useUserStore } from './user'
+
+/**
+ * The icon a page starts with.
+ *
+ * An Iconify reference, so that the icon picker opens on its search tab with this one selected rather
+ * than on the custom tab. Kept to a set seeded on every instance (`mdi`), so that it resolves without
+ * an administrator having added anything.
+ */
+export const DEFAULT_PAGE_ICON = 'mdi:file-document-outline'
+
+/**
+ * The page properties a copy of a page starts with, as `pageDuplicate` reads them off the source.
+ *
+ * Everything the properties panel edits, less the four a copy cannot be given. `title`, `path` and
+ * `locale` are what the author just picked in the dialog, and `description` comes across as an
+ * argument of its own. `alias` is unique across the site, so a copy carrying the source's would be
+ * refused with a 409 nobody asked for. `localeRelations` is a translation set that already holds a
+ * page for this locale -- refused the same way. Both are left for the author to fill in on the copy.
+ */
+const DUPLICATED_PAGE_PROPS = [
+  'allowBacklinks',
+  'allowComments',
+  'allowContributions',
+  'allowGlossaryLinks',
+  'allowRatings',
+  'icon',
+  'isBrowsable',
+  'isSearchable',
+  'password',
+  'publishEndDate',
+  'publishStartDate',
+  'publishState',
+  'relations',
+  'scriptCss',
+  'scriptJsLoad',
+  'scriptJsUnload',
+  'showLastEditedBy',
+  'showSidebar',
+  'showTags',
+  'showToc',
+  'tags',
+  'tocDepth'
+]
+
+export const usePageStore = defineStore('page', {
+  state: () => ({
+    alias: '',
+    /** Whether this page shows its Links tab. The site-wide switch is `siteStore.features.backlinks`. */
+    allowBacklinks: true,
+    allowComments: true,
+    allowContributions: true,
+    /** Whether glossary terms are linked in this page's text. The site-wide switch is `features.glossaryAutoLink`. */
+    allowGlossaryLinks: true,
+    allowRatings: true,
+    authorId: 0,
+    authorName: '',
+    authorHasAvatar: false,
+    /**
+     * The blog this page is a post of, as `{ path, title }`, or null for a page that is not in one.
+     *
+     * Answered by the server with the page, because it cannot be answered here: a post is a post by
+     * sitting under a blog's path, and which of this page's ancestors is a blog is a lookup. The
+     * NEAREST one, so a blog inside a blog owns its own posts.
+     */
+    blog: null,
+    commentsCount: 0,
+    content: '',
+    /**
+     * Whether `content` above is this page's actual source, rather than just the state it starts in.
+     *
+     * The API leaves `content` out of a page unless an editor asked for it and the session may see it,
+     * so an empty string in this store means either "the page is empty" or "nobody fetched it" — and
+     * `pageSave` must not write the second one over a page that has content. See the guard there.
+     */
+    contentLoaded: false,
+    /**
+     * The other editors this page could be opened with, as the server works it out — every editor
+     * producing the same content type, which is Markdown and Visual for a markdown page and nobody at
+     * all for a redirection. Not filtered by what the site has enabled; `PageConvertDialog` is what
+     * narrows it to the editors somebody could actually open afterwards.
+     */
+    convertibleTo: [],
+    createdAt: '',
+    description: '',
+    editor: '',
+    icon: DEFAULT_PAGE_ICON,
+    id: '',
+    isBrowsable: true,
+    /**
+     * Whether the server withheld this page's body because it is password protected and this reader
+     * has not entered the password. `render`, `toc` and `content` are empty while it is set — the API
+     * never sent them — so nothing here can display a locked page by mistake.
+     */
+    isLocked: false,
+    isSearchable: true,
+    locale: 'en',
+    navigationId: null,
+    navigationMode: 'inherit',
+    /**
+     * The header fields as the server last told us they are, kept beside the live ones.
+     *
+     * Not a duplicate: `title`, `description` and `icon` hold what is ON SCREEN, which the properties
+     * panel edits long before anything is saved. This is what those were before the author touched
+     * them, and the only thing that asks is the collaborative session — see `adoptProps` in
+     * `composables/collab.js`, which needs to tell a room echoing the database back from a room
+     * holding somebody else's unsaved edit.
+     */
+    storedProps: { title: '', description: '', icon: '' },
+    /**
+     * Whether the path in the URL has no page at all. Set by `pageNotFound`, which empties everything
+     * else here at the same time — so this being true means the store holds the *absence* of a page,
+     * not a page that failed to load with the previous one's title and body still in it.
+     */
+    notFound: false,
+    password: '',
+    path: '',
+    publishEndDate: '',
+    publishStartDate: '',
+    publishState: '',
+    relations: [],
+    /**
+     * The same page in other locales: `{ locale, path, title }`, one entry per locale, as the server
+     * knows them. What the locale selector sends a reader to instead of guessing at the same path in
+     * another language, and what the page properties panel edits as one set.
+     */
+    localeRelations: [],
+    render: '',
+    /**
+     * Whether `render` above is HTML an editor in this session produced, rather than the page's own.
+     *
+     * Every page load fills `render` from the server, and what comes back has already been through
+     * `postProcess` — so sending it up again re-sanitizes an output rather than an input, which is not
+     * the no-op it looks like. It is done with the SAVING session's permissions, so a save by somebody
+     * without `write:scripts` on the page strips the author's `<script>` out of a render nobody
+     * touched. And the properties panel, the tags editor and the locale relations dialog all reach the
+     * Save button with no editor open at all, which is exactly that case.
+     *
+     * So the render goes up only when an editor made one — `updatePage` leaves the column alone for a
+     * key it was not sent. See the guard in `pageSave`, which is the same shape as `contentLoaded`'s.
+     */
+    renderProduced: false,
+    scriptJsLoad: '',
+    scriptJsUnload: '',
+    scriptCss: '',
+    showLastEditedBy: true,
+    showSidebar: true,
+    showTags: true,
+    showToc: true,
+    tags: [],
+    title: '',
+    toc: [],
+    tocDepth: {
+      min: 1,
+      max: 2
+    },
+    updatedAt: '',
+    /**
+     * Whether this reader may suggest edits to this page, i.e. an enabled approval rule covers it and
+     * names a group they are in. Answered by the server, since neither the rules nor the reader's
+     * groups are known here — and left false until it does, so the button never flashes into view on
+     * a page that turns out not to take suggestions.
+     */
+    canSuggestEdits: false,
+    /** Whether the reader already has a suggestion open on this page, which they would carry on with. */
+    hasOpenSuggestion: false,
+    /** Whether this reader reviews this page, which is what shows the review button on it. */
+    canReview: false,
+    /** The suggestions waiting on this page, oldest first. Empty for everybody who is not its reviewer. */
+    pendingSubmissions: [],
+    /**
+     * Whether this reader has asked to be told about changes to this page. Always false for a guest:
+     * a watch belongs to an account, which is what a notification would eventually be sent to.
+     */
+    isWatching: false,
+    /**
+     * The notification categories this reader has unread entries in about this page. Opening the page
+     * marks the ones about its content read, and opening its Talk tab the ones about its discussion —
+     * see `markSeen` in the notifications store.
+     */
+    unreadNotifications: [],
+    /**
+     * How readers have rated this page, as `{ mode, count, average, up, down }` on the site's current
+     * scale, or null when ratings are off for the site or for the page.
+     */
+    rating: null,
+    /**
+     * This reader's own rating on that scale: 1 or -1 for thumbs, 1 to 5 for stars, 0 for none.
+     * Always 0 for a guest, who cannot rate.
+     */
+    viewerRating: 0
+  }),
+  getters: {
+    breadcrumbs: (state) => {
+      const siteStore = useSiteStore()
+      const pathPrefix = siteStore.localeUrlPrefix(state.locale)
+      return state.path.split('/').reduce((result, value, key) => {
+        result.push({
+          id: key,
+          title: value,
+          icon: 'la:file-alt',
+          locale: 'en',
+          path: (result.at(-1)?.path || pathPrefix) + `/${value}`
+        })
+        return result
+      }, [])
+    },
+    folderPath: (state) => {
+      return state.path.split('/').slice(0, -1).join('/')
+    },
+    isHome: (state) => {
+      return ['', 'home'].includes(state.path)
+    },
+    /**
+     * Where to send someone who is leaving the editor on this page.
+     *
+     * Its own path, except for a redirection, which is held on arrival: whoever just wrote down where
+     * this page sends people is the one person who does not want to be sent there. `?redirect=no` is
+     * what holds it — see `PageRedirect.vue` — and the screen it lands on offers to follow it.
+     */
+    /**
+     * Where the editor for this page lives.
+     *
+     * A path of its own rather than a flag set on the page's own URL. That is the whole point: with
+     * the editor at the page's address, opening it changed nothing the router could see, so leaving it
+     * was left to a watcher on the path — and every way out that did not change the path (the site
+     * logo on the home page, a link to the page being edited) simply did not close it. Here, opening
+     * and closing are both navigations, and `editorExitPath` is the way back.
+     *
+     * The locale rides along as a query rather than as a prefix: `/_edit/...` is the application's own
+     * path and is never bracketed by locale, so the page it names would otherwise be ambiguous on a
+     * site holding the same path in several. Absent for the primary locale, which is what the API
+     * assumes when it is not told.
+     */
+    editPath: (state) => {
+      const siteStore = useSiteStore()
+      const query =
+        state.locale && state.locale !== siteStore.locales.primary
+          ? `?locale=${encodeURIComponent(state.locale)}`
+          : ''
+      return `/_edit/${state.path}${query}`
+    },
+    editorExitPath: (state) => {
+      // -> Prefixed, on a site that brackets its URLs by locale: an unprefixed path is sent to the
+      //    PRIMARY locale, so leaving the editor on a page just written in another one landed the
+      //    author on the English page instead of the French one they had made
+      const siteStore = useSiteStore()
+      return `${siteStore.localeUrlPrefix(state.locale)}/${state.path}${
+        state.editor === 'redirect' ? '?redirect=no' : ''
+      }`
+    }
+  },
+  actions: {
+    /**
+     * PAGE - LOAD
+     *
+     * Nothing in this store moves until the reply is in hand: the page being read stays on screen,
+     * whole, for as long as the request takes, and then the next one replaces it in a single change.
+     * That is what `applyWith` is for -- it wraps the moment everything changes, so the page view can
+     * hand that moment to the View Transition API and have the two cross-faded. Left at its default
+     * the change simply happens, which is what a same-page refresh wants.
+     *
+     * @param {(apply: () => void) => void|Promise<void>} [applyWith] Runs the given function, which
+     *   is what puts the loaded page into this store. Called only on success, exactly once.
+     */
+    async pageLoad({ path, id, locale, withContent = false, applyWith = (apply) => apply() }) {
+      const editorStore = useEditorStore()
+      const siteStore = useSiteStore()
+      try {
+        const pageData = await API_CLIENT.get(
+          `sites/${siteStore.id}/pages/${id ?? fastHash(normalizePath(path))}`,
+          {
+            searchParams: {
+              withContent,
+              // -> Absent means the site's primary locale, which is what an unprefixed URL addresses
+              ...(locale && { locale })
+            }
+          }
+        ).json()
+        if (!pageData?.id) {
+          throw new Error('ERR_PAGE_NOT_FOUND')
+        }
+        // Update page store
+        await applyWith(() => {
+          this.$patch({
+            ...pageData,
+            // -> The field is present exactly when the source came with the page, which is what makes
+            //    the copy in this store safe to save; a view-mode load leaves the previous one in place
+            contentLoaded: Object.hasOwn(pageData, 'content'),
+            // -> `...pageData` above brought the stored render with it; see `renderProduced`
+            renderProduced: false,
+            relations: pageData.relations.map((r) =>
+              pick(r, ['id', 'position', 'label', 'caption', 'icon', 'target'])
+            ),
+            localeRelations: (pageData.localeRelations ?? []).map((r) =>
+              pick(r, ['locale', 'path', 'title'])
+            ),
+            tocDepth: pick(pageData.tocDepth, ['min', 'max']),
+            /*
+              The absence of a page is not something the reply carries -- it is what the page view
+              says when there was no reply at all -- so arriving at one clears it here. `isLocked`
+              needs no such help: every page answers with it, so `...pageData` above has already
+              settled whether THIS page is protected.
+            */
+            notFound: false,
+            storedProps: storedPropsOf(pageData)
+          })
+          this.applyViewerState(pageData.viewer)
+          // Update editor state timestamps
+          const curDate = Temporal.Now.instant()
+          editorStore.$patch({
+            lastChangeTimestamp: curDate,
+            lastSaveTimestamp: curDate
+          })
+        })
+      } catch (err) {
+        // -> A missing page is an ordinary outcome, not a failure: it is what puts a new instance in
+        //    front of the welcome screen, and what offers to create the page anywhere else
+        if (err.response?.status === 404) {
+          throw new Error('ERR_PAGE_NOT_FOUND')
+        }
+        /*
+          Nor is a page the reader may not open: the group rules say so deliberately, and the reader
+          is owed the unauthorized screen -- which offers signing in as somebody else -- rather than
+          an error banner over an empty page view.
+        */
+        if (err.response?.status === 403) {
+          throw new Error('ERR_PAGE_UNAUTHORIZED')
+        }
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - UNLOCK
+     *
+     * Hands a password for a protected page to the server, which answers with the page — body
+     * included — when it matches. The reply is what fills the content in, rather than this store
+     * flipping `isLocked` and re-reading a page it already had: there is nothing here to unlock, the
+     * body was never sent.
+     *
+     * The server also remembers the unlock for the session, so navigating away and back does not ask
+     * again.
+     *
+     * @param {string} password
+     * @throws When the password is wrong (401) or the request fails; the caller reports it.
+     */
+    async pageUnlock(password) {
+      const siteStore = useSiteStore()
+      const pageData = await API_CLIENT.post(`sites/${siteStore.id}/pages/${this.id}/unlock`, {
+        json: { password }
+      }).json()
+      this.$patch({
+        ...pageData,
+        contentLoaded: Object.hasOwn(pageData, 'content'),
+        renderProduced: false,
+        relations: pageData.relations.map((r) =>
+          pick(r, ['id', 'position', 'label', 'caption', 'icon', 'target'])
+        ),
+        localeRelations: (pageData.localeRelations ?? []).map((r) =>
+          pick(r, ['locale', 'path', 'title'])
+        ),
+        tocDepth: pick(pageData.tocDepth, ['min', 'max']),
+        storedProps: storedPropsOf(pageData)
+      })
+    },
+    /**
+     * PAGE - WATCH / UNWATCH
+     *
+     * Asks to be told about changes to this page, or stops asking.
+     *
+     * The store is moved first and put back if the server refuses. A bell that waits for a round trip
+     * before it rings is a bell that feels broken, and the request behind it either succeeds or is
+     * worth an error — there is no third outcome to leave the button guessing at.
+     *
+     * @throws Whatever the request failed with, for the caller to report.
+     */
+    async pageWatch(watching) {
+      const siteStore = useSiteStore()
+      const previous = this.isWatching
+      this.isWatching = watching
+      try {
+        const url = `sites/${siteStore.id}/pages/${this.id}/watch`
+        await (watching ? API_CLIENT.put(url) : API_CLIENT.delete(url))
+      } catch (err) {
+        this.isWatching = previous
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - RATE
+     *
+     * Gives this page a rating, or withdraws it with 0. Moved first and put back on a refusal, the way
+     * `pageWatch` is; the summary is then taken from the server's answer, since other readers may have
+     * rated in the meantime.
+     *
+     * @throws Whatever the request failed with, for the caller to report.
+     */
+    async pageRate(value) {
+      const siteStore = useSiteStore()
+      const previous = this.viewerRating
+      this.viewerRating = value
+      try {
+        const url = `sites/${siteStore.id}/pages/${this.id}/rating`
+        const resp = await (
+          value ? API_CLIENT.put(url, { json: { value } }) : API_CLIENT.delete(url)
+        ).json()
+        this.$patch({ rating: resp.rating, viewerRating: resp.value })
+      } catch (err) {
+        this.viewerRating = previous
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - APPLY VIEWER STATE
+     *
+     * Takes in the `viewer` block the page came with: what this reader may do here, whether they may
+     * suggest an edit, and what they have to review on this page. The page view used to ask three
+     * further endpoints for exactly this, each of which loaded the page again to answer — so the one
+     * request now settles what the whole view draws.
+     *
+     * The page permissions go to the user store, which is where everything reads them from: they are
+     * the reader's, not the page's, and `userStore.can()` consults them for the path in front of them.
+     *
+     * @param viewer Absent from a page that came back from a save or an unlock, which changes none of
+     *               this — so nothing here is touched in that case.
+     */
+    applyViewerState(viewer) {
+      if (!viewer) {
+        return
+      }
+      const userStore = useUserStore()
+      userStore.$patch({ pagePermissions: viewer.permissions ?? [] })
+      this.$patch({
+        canSuggestEdits: viewer.canSuggestEdits === true,
+        hasOpenSuggestion: viewer.hasOpenSuggestion === true,
+        canReview: viewer.canReview === true,
+        pendingSubmissions: viewer.pendingSubmissions ?? [],
+        isWatching: viewer.isWatching === true,
+        unreadNotifications: viewer.unreadNotifications ?? [],
+        viewerRating: viewer.rating ?? 0
+      })
+    },
+    /**
+     * PAGE - NOT FOUND
+     *
+     * Puts the store in front of a path that has no page, so that the view can offer to create one.
+     *
+     * A load that fails leaves the previous page standing — see `pageLoad`, where that is on purpose —
+     * and for a path with nothing behind it that means the reader is left reading the page they came
+     * from under a URL that is not its own. So everything the page view draws is emptied here, and
+     * `path` becomes the one that was asked for — the only thing about a page that does not exist that
+     * is actually known, and what the create button goes on to make a page at.
+     *
+     * @param {string} path The path that was requested, with or without its leading slash.
+     * @param {string} [locale] The locale it was requested in. A page that does not exist still has
+     *   one — it is what a create button started from here writes the page in — and leaving the
+     *   previous page's locale standing is how creating the French home page tried to write the
+     *   English one and was refused as a duplicate.
+     */
+    pageNotFound({ path, locale }) {
+      this.$patch({
+        id: '',
+        locale: locale || this.locale,
+        path: (path ?? '').replace(/^\/+/, ''),
+        title: '',
+        description: '',
+        icon: DEFAULT_PAGE_ICON,
+        content: '',
+        contentLoaded: false,
+        render: '',
+        renderProduced: false,
+        toc: [],
+        tags: [],
+        relations: [],
+        localeRelations: [],
+        scriptJsLoad: '',
+        scriptJsUnload: '',
+        scriptCss: '',
+        createdAt: '',
+        updatedAt: '',
+        publishState: '',
+        isLocked: false,
+        canSuggestEdits: false,
+        hasOpenSuggestion: false,
+        canReview: false,
+        pendingSubmissions: [],
+        isWatching: false,
+        unreadNotifications: [],
+        rating: null,
+        viewerRating: 0,
+        blog: null,
+        notFound: true
+      })
+    },
+    /**
+     * PAGE - GET PATH FROM ALIAS
+     */
+    async pageAlias(alias) {
+      return this.resolveShortLink(`alias/${encodeURIComponent(alias)}`)
+    },
+    /**
+     * PAGE - RESOLVE ID
+     *
+     * The same short link by the one name a page never loses. An alias can be retyped and a path can
+     * be moved; the id outlives both, which is what makes `/i/<id>` the link to paste where it has to
+     * keep working.
+     */
+    async pageById(id) {
+      return this.resolveShortLink(`id/${encodeURIComponent(id)}`)
+    },
+    /**
+     * Where a short link points, as a path this app can navigate to.
+     *
+     * The locale comes back with the path and is part of the answer, not decoration: on a site that
+     * brackets its URLs by locale, `/notes/one` is the ENGLISH page and the French one is at
+     * `/fr/notes/one`. Built with `localeUrlPrefix`, which is empty where the site needs no prefix —
+     * so a short link to a page in another locale lands on that page rather than on whatever happens
+     * to sit at the same path in the primary one.
+     *
+     * @param {string} lookup The `alias/<alias>` or `id/<uuid>` half of the endpoint path.
+     * @returns {Promise<string>} A rooted path, prefix and all.
+     * @throws `ERR_PAGE_NOT_FOUND` when nothing answers to it, or the reader may not know it does.
+     */
+    async resolveShortLink(lookup) {
+      const siteStore = useSiteStore()
+      try {
+        const target = await API_CLIENT.get(`sites/${siteStore.id}/pages/${lookup}`).json()
+        if (!target?.id) {
+          throw new Error('ERR_PAGE_NOT_FOUND')
+        }
+        return `${siteStore.localeUrlPrefix(target.locale)}/${target.path}`
+      } catch (err) {
+        if (err.response?.status === 404) {
+          throw new Error('ERR_PAGE_NOT_FOUND')
+        }
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - CREATE
+     */
+    /**
+     * @param props Page properties the new page starts with, over the defaults below -- which is
+     *   what duplicating a page carries across from its source. Every key is optional and an absent
+     *   one means the default, so creating a blank page passes none of them.
+     */
+    async pageCreate({
+      editor,
+      locale,
+      path,
+      basePath,
+      title = '',
+      description = '',
+      content = '',
+      props = {},
+      fromNavigate = false
+    } = {}) {
+      const editorStore = useEditorStore()
+
+      // -> Load editor config
+      if (!editorStore.configIsLoaded) {
+        await editorStore.fetchConfigs()
+      }
+
+      // -> Path normalization
+      if (path?.startsWith('/')) {
+        path = path.substring(1)
+      }
+      if (basePath?.startsWith('/')) {
+        basePath = basePath.substring(1)
+      }
+      if (basePath?.endsWith('/')) {
+        basePath = basePath.substring(0, basePath.length - 1)
+      }
+
+      // -> Redirect if not at /_create path
+      if (!this.router.currentRoute.value.path.startsWith('/_create/') && !fromNavigate) {
+        editorStore.$patch({ ignoreRouteChange: true })
+        this.router.push(`/_create/${editor}`)
+      }
+
+      // -> Init editor
+      editorStore.$patch({
+        originPageId: editorStore.isActive ? editorStore.originPageId : this.id, // Don't replace if already in edit mode
+        isActive: true,
+        mode: 'create',
+        editor
+      })
+
+      /*
+        -> Default Page Path
+
+           A new page is a SIBLING of the one it was started from, which is what makes "New Page" from
+           somewhere in a section put the page in that section.
+
+           A blog's front page is the exception, and is the one place the natural default is a CHILD:
+           a post is a post by sitting under the blog's path, so starting a page from a blog and
+           having it land beside the blog rather than in it would be the one mistake the whole feature
+           makes easy. Held to a SAVED blog (`this.id`), since a page being created is not one yet.
+
+           Not for another BLOG, though, which is the one thing somebody standing on a blog cannot
+           mean to put inside it: a nested blog takes that part of the outer blog's posts with it.
+           The reason for the exception is that a page under a blog is a post, and a blog is not one.
+
+           A caller that named a `basePath` -- the file manager, which is looking at a folder rather
+           than at a page -- has already answered the question and is never second-guessed.
+      */
+      let newPath = path
+      if (!path && path !== '') {
+        const intoBlog = this.editor === 'blog' && Boolean(this.id) && editor !== 'blog'
+        const siblingPath = intoBlog ? this.path : this.path.split('/').slice(0, -1).join('/')
+        const parentPath = basePath || basePath === '' ? basePath : siblingPath
+        newPath = parentPath ? `${parentPath}/new-page` : 'new-page'
+      }
+
+      // -> Set Default Page Data
+      this.$patch({
+        id: 0,
+        locale: locale || this.locale,
+        path: newPath,
+        /*
+          The editor is a field of the page being written, not just of the editor holding it: anything
+          asking what KIND of page is on screen reads it here. Left unset, the store kept the last
+          page's answer -- so opening a new page from a redirection said it was one too.
+        */
+        editor,
+        title: title ?? '',
+        description: description ?? '',
+        icon: props.icon ?? DEFAULT_PAGE_ICON,
+        // -> Never carried over by a copy: see `DUPLICATED_PAGE_PROPS`
+        alias: '',
+        publishState: props.publishState ?? 'published',
+        /*
+          Set here alongside the state they belong to rather than left at whatever page the store
+          last held: a `scheduled` page with no dates is refused, and so is a date on a page that is
+          not scheduled, so the three only ever make sense together.
+        */
+        publishStartDate: props.publishStartDate ?? '',
+        publishEndDate: props.publishEndDate ?? '',
+        relations: props.relations ?? [],
+        // -> A page being created is in no translation set yet, whatever the page it was started from
+        //    belonged to -- a copy included, whose set already holds a page for this locale
+        localeRelations: [],
+        tags: props.tags ?? [],
+        allowBacklinks: props.allowBacklinks ?? true,
+        allowComments: props.allowComments ?? true,
+        allowContributions: props.allowContributions ?? true,
+        allowGlossaryLinks: props.allowGlossaryLinks ?? true,
+        allowRatings: props.allowRatings ?? true,
+        showLastEditedBy: props.showLastEditedBy ?? true,
+        showSidebar: props.showSidebar ?? true,
+        showTags: props.showTags ?? true,
+        showToc: props.showToc ?? true,
+        tocDepth: props.tocDepth ?? { min: 1, max: 2 },
+        /*
+          Writing either one needs a permission (`write:scripts`, `write:styles`), and the server
+          drops what an author may not write rather than refusing the page -- so a copy made by
+          somebody without them arrives without them, which is the right answer either way.
+        */
+        scriptJsLoad: props.scriptJsLoad ?? '',
+        scriptJsUnload: props.scriptJsUnload ?? '',
+        scriptCss: props.scriptCss ?? '',
+        /*
+          A copy of a protected page is protected too. The source's password is only in the answer
+          for a requester who may edit it -- and that is the same requester the source's CONTENT is
+          in the answer for, so a copy can never end up holding the body without the lock.
+        */
+        password: props.password ?? '',
+        content: content ?? '',
+        // -> A page being created has no stored source to lose: whatever it starts with IS the source
+        contentLoaded: true,
+        render: '',
+        renderProduced: false,
+        /*
+          A redirection is in neither the browse menu nor search by default: the first because it is a
+          doorway rather than a page to land on, the second because a result for one would stand in
+          front of the page the reader actually wanted. The server settles both the same way -- see
+          `createPage` in `models/pages.ts` -- so this is the store agreeing with it rather than
+          deciding it. The difference is that browsing is a choice the author can turn back on, in the
+          redirect editor or the properties panel, and searching is not offered at all.
+
+          A copy states the source's answer instead, since both are properties panel fields. That
+          cannot smuggle a searchable redirection in: `createPage` forces `isSearchable` false for
+          one whatever it was sent, so the source's own answer was already false.
+        */
+        isBrowsable: props.isBrowsable ?? editor !== 'redirect',
+        isSearchable: props.isSearchable ?? editor !== 'redirect',
+        /*
+          A page being created is not a post of anything yet: it has not been saved, so no blog has it
+          under its path. Cleared rather than left at whatever the page this one was started from
+          answered -- which, when that page WAS a post, is the blog it belonged to.
+        */
+        blog: null,
+        // -> The page being created is very often the one that was missing, and it is not missing now
+        notFound: false,
+        // -> Nothing is stored for a page that does not exist, so everything about it is pending
+        storedProps: { title: '', description: '', icon: '' },
+        mode: 'edit'
+      })
+
+      /*
+        -> Page permissions at the path the new page will sit at
+
+        Everywhere else they arrive with the page itself (`pageLoad`), and a page being created has
+        no page to carry them -- while `/_create` is not a page path, so the guard in `App.vue` has
+        just dropped whatever the page being left granted. Left empty, the properties panel hid every
+        section that is gated on one -- Scripts, Styles, Tags -- until the page had been saved once.
+
+        Asked of the new path and not of the page the author started from, since a rule is granted
+        per path: starting a page in a section they may write scripts in is what decides it.
+      */
+      if (newPath) {
+        await useUserStore().fetchPagePermissions(newPath, this.locale)
+      }
+    },
+    /**
+     * PAGE - DUPLICATE
+     *
+     * A copy is the whole page and not just its text: the properties panel is where most of what
+     * makes a page what it is lives -- its tags, its relations, its per-page CSS and scripts, what
+     * its sidebar shows, whether it is browsable, its password -- and a copy that dropped all of it
+     * left the author reproducing the original by hand beside it. Carried across through
+     * `pageCreate`, which is what makes them survive as far as the save: `pageSave` sends every one
+     * of these fields on a create, so seeding the store is all that was ever missing.
+     *
+     * Nothing is written here. What comes back from the dialog is where the copy should go, and the
+     * editor opens on an unsaved page -- so a duplicate nobody saves never existed.
+     */
+    async pageDuplicate({ sourcePageId, title, path, locale }) {
+      const siteStore = useSiteStore()
+      try {
+        const pageData = await API_CLIENT.get(
+          `sites/${siteStore.id}/pages/${sourcePageId ?? this.id}`,
+          { searchParams: { withContent: true } }
+        ).json()
+        if (!pageData?.id) {
+          throw new Error('ERR_PAGE_NOT_FOUND')
+        }
+        await this.pageCreate({
+          editor: pageData.editor,
+          title,
+          path,
+          // -> A copy may be made in another locale, which is how a translation starts: the same page
+          //    at the same path, in a locale that does not have it yet
+          locale,
+          content: pageData.content,
+          description: pageData.description,
+          /*
+            Picked rather than spread: the answer also carries what identifies the SOURCE -- its id,
+            its hash, its author, its dates, the reader's own standing on it -- and none of that
+            describes the page being written.
+
+            `relations` is narrowed to its own fields on the way in, as `pageLoad` does with it: it
+            is the one field of these whose schema is `additionalProperties: true`, so it is the one
+            whose extra keys survive being serialized and would be written back out on the copy.
+          */
+          props: {
+            ...pick(pageData, DUPLICATED_PAGE_PROPS),
+            relations: (pageData.relations ?? []).map((r) =>
+              pick(r, ['id', 'position', 'label', 'caption', 'icon', 'target'])
+            )
+          }
+        })
+      } catch (err) {
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - SUGGEST EDITS
+     *
+     * Opens the editor on a suggestion rather than on the page. The source comes from the suggestion
+     * endpoint rather than from the page: it hands back whatever this reader already suggested, so
+     * that coming back to the button carries on from where they left off, and it is also the only way
+     * an anonymous reader gets the source at all.
+     */
+    async pageSuggest() {
+      const editorStore = useEditorStore()
+      const siteStore = useSiteStore()
+
+      const resp = await API_CLIENT.get(`sites/${siteStore.id}/pages/${this.id}/suggestions/self`, {
+        searchParams: { withContent: true }
+      }).json()
+      if (!resp?.canSubmit) {
+        throw new Error('ERR_SUGGESTIONS_NOT_ALLOWED')
+      }
+
+      this.$patch({
+        content: resp.content ?? '',
+        contentLoaded: true,
+        canSuggestEdits: true,
+        hasOpenSuggestion: Boolean(resp.submission)
+      })
+
+      if (!editorStore.configIsLoaded) {
+        await editorStore.fetchConfigs()
+      }
+
+      const curDate = Temporal.Now.instant()
+      editorStore.$patch({
+        isActive: true,
+        mode: 'suggest',
+        editor: this.editor,
+        lastChangeTimestamp: curDate,
+        lastSaveTimestamp: curDate
+      })
+    },
+    /**
+     * PAGE - SUBMIT SUGGESTED EDITS
+     *
+     * @param {object} [guest] Name and email, required when nobody is logged in
+     */
+    async pageSubmitSuggestion({ guestName, guestEmail } = {}) {
+      const siteStore = useSiteStore()
+      const resp = await API_CLIENT.put(`sites/${siteStore.id}/pages/${this.id}/suggestions/self`, {
+        json: {
+          content: this.content,
+          ...(guestName ? { guestName } : {}),
+          ...(guestEmail ? { guestEmail } : {})
+        }
+      }).json()
+      if (!resp?.ok) {
+        throw new Error(resp?.message || 'An unexpected error occured.')
+      }
+      this.hasOpenSuggestion = true
+      return resp.submission
+    },
+    /**
+     * PAGE - EDIT
+     */
+    async pageEdit({ path, id, locale, fromNavigate = false } = {}) {
+      const editorStore = useEditorStore()
+
+      const loadArgs = {
+        withContent: true
+      }
+
+      if (id) {
+        loadArgs.id = id
+      } else if (path) {
+        loadArgs.path = path
+        // -> A path only names a page within a locale; absent, the API answers with the primary one
+        if (locale) {
+          loadArgs.locale = locale
+        }
+      } else {
+        loadArgs.id = this.id
+      }
+
+      /*
+        Edits made OUTSIDE the editor have to survive opening it.
+
+        The page properties panel writes straight to this store, and the header then offers to save
+        them — so a page can arrive here with a changed title and an unchanged everything else. A full
+        load would replace every field with what is stored and reset the change timestamps, throwing
+        those edits away without a word. The source is the only thing missing in that state, so the
+        source is the only thing fetched.
+
+        `isPageInStore` is what keeps that from being a way to open the WRONG page. Pending changes
+        belong to whatever this store is holding, and the flag says nothing about which page that is —
+        so opening the editor on a different one took the shortcut too, skipped the load, and left the
+        author editing the previous page's title, description and icon under the new page's name.
+        Worse where there was no previous page to speak of: a create that was abandoned leaves the
+        store holding a blank one, and every Edit after it opened on empty metadata.
+
+        A page identified by neither an id nor a path is this store's own page by definition, which is
+        what the header's Edit button asks for.
+      */
+      const isPageInStore = id
+        ? id === this.id
+        : !path || normalizePath(path) === normalizePath(this.path)
+      if (editorStore.hasPendingChanges && isPageInStore) {
+        await this.pageLoadSource()
+      } else {
+        await this.pageLoad(loadArgs)
+      }
+
+      if (!editorStore.configIsLoaded) {
+        await editorStore.fetchConfigs()
+      }
+
+      editorStore.$patch({
+        isActive: true,
+        mode: 'edit',
+        editor: this.editor
+      })
+    },
+    /**
+     * PAGE - LOAD SOURCE ONLY
+     *
+     * Fetches the source and nothing else, for opening the editor on a page whose other fields have
+     * already been edited elsewhere. Deliberately touches neither the rest of the page nor the editor's
+     * change timestamps: what is pending stays pending, and stays saveable.
+     */
+    async pageLoadSource() {
+      const siteStore = useSiteStore()
+      try {
+        const pageData = await API_CLIENT.get(`sites/${siteStore.id}/pages/${this.id}`, {
+          searchParams: { withContent: true }
+        }).json()
+        // -> Absent rather than empty means the server withheld it; see `contentLoaded`
+        if (!Object.hasOwn(pageData ?? {}, 'content')) {
+          throw new Error('ERR_PAGE_SOURCE_UNAVAILABLE')
+        }
+        this.$patch({
+          content: pageData.content,
+          contentLoaded: true
+        })
+      } catch (err) {
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * PAGE - MOVE
+     */
+    /**
+     * @returns What became of the pages linking to the old address when `updateLinks` was asked for
+     *          -- `{ updated, skippedCount, skipped }` -- and null otherwise.
+     */
+    async pageMove({ id, title, path, locale, updateLinks = false } = {}) {
+      const siteStore = useSiteStore()
+      const resp = unwrap(
+        await API_CLIENT.put(`sites/${siteStore.id}/pages/${id}/path`, {
+          json: {
+            path,
+            ...(title ? { title } : {}),
+            // -> A move may cross locales, which is the same page translated rather than a new one
+            ...(locale ? { locale } : {}),
+            updateLinks
+          }
+        }).json()
+      )
+      // -> Following the page only makes sense when it is the one being viewed. Moved from the file
+      //    manager, it is some other page, and the reader is still on theirs.
+      if (id === this.id) {
+        this.$patch({ path, ...(locale ? { locale } : {}) })
+        this.router.replace(this.editorExitPath)
+      }
+      return resp?.relinked ?? null
+    },
+    /**
+     * PAGE - Rename
+     */
+    async pageRename({ id, title } = {}) {
+      const siteStore = useSiteStore()
+      unwrap(
+        await API_CLIENT.patch(`sites/${siteStore.id}/pages/${id}`, {
+          json: { title }
+        }).json()
+      )
+
+      // Update page store
+      if (id === this.id) {
+        this.$patch({ title })
+      }
+    },
+    /**
+     * Take the HTML an editor has just produced for the page in this store.
+     *
+     * The one way `render` is written from the client, so that the flag saying it may be saved cannot
+     * drift from the value it describes — see `renderProduced`.
+     *
+     * @param {string} html
+     */
+    setRender(html) {
+      this.$patch({
+        render: html,
+        renderProduced: true
+      })
+    },
+    /**
+     * PAGE SAVE
+     */
+    async pageSave() {
+      const editorStore = useEditorStore()
+      const siteStore = useSiteStore()
+      try {
+        // -> The render goes up with the content: the markdown pipeline runs here, in the editor, and
+        //    what the preview shows is what gets stored. The server post-processes it — sanitizing it
+        //    against what this author may embed, and deriving the table of contents — so the page it
+        //    returns is the authority on what was actually saved.
+        const body = {
+          ...pick(this, [
+            'alias',
+            'allowBacklinks',
+            'allowComments',
+            'allowContributions',
+            'allowGlossaryLinks',
+            'allowRatings',
+            'content',
+            'description',
+            'icon',
+            'isBrowsable',
+            'isSearchable',
+            'localeRelations',
+            'password',
+            'publishEndDate',
+            'publishStartDate',
+            'publishState',
+            'relations',
+            'render',
+            'scriptJsLoad',
+            'scriptJsUnload',
+            'scriptCss',
+            'showLastEditedBy',
+            'showSidebar',
+            'showTags',
+            'showToc',
+            'tags',
+            'title',
+            'tocDepth'
+          ]),
+          /*
+            Not a page field: it describes the save rather than the page, and the server records it on
+            the history version this save produces. Collected by the reason-for-change dialog before
+            `pageSave` is called, and cleared below once it has gone up.
+          */
+          reasonForChange: editorStore.reasonForChange ?? ''
+        }
+
+        /*
+          Never save a source this store never received.
+
+          An editor that came up empty because the source was withheld — an expired session, a failed
+          load — is indistinguishable from an empty page by the time the payload is built, and sending
+          the empty string replaces the stored HTML's source with nothing. Dropping the key instead
+          leaves it exactly as it was: `updatePage` only writes `content` when it is not `undefined`.
+
+          Typing into an editor sets the flag, so deliberately clearing a page still works — that empty
+          string came from the author, not from a load that never happened. A page being created always
+          has it set, which is also why this cannot leave the POST short of a required field.
+        */
+        if (!this.contentLoaded) {
+          delete body.content
+          console.warn('Page source was never loaded; saving without touching the stored content.')
+        }
+
+        /*
+          And never send back a render this store did not make.
+
+          Every page load fills `render` from the server, so unless an editor has replaced it the store
+          is holding the page's own stored HTML — already sanitized, already anchored, already reduced
+          to a table of contents. Sending that up runs `postProcess` over its own output, with this
+          session's permissions and not the author's, which is how changing a tag from the page view
+          strips the `<script>` out of a page somebody else wrote. Dropping the key leaves the column
+          alone, and the only save that has nothing to say about the render is one that did not touch
+          the source.
+        */
+        if (!this.renderProduced) {
+          delete body.render
+        }
+
+        let pageData
+        if (editorStore.mode === 'create') {
+          const resp = unwrap(
+            await API_CLIENT.post(`sites/${siteStore.id}/pages`, {
+              json: {
+                ...body,
+                locale: this.locale,
+                path: this.path,
+                editor: editorStore.editor
+              }
+            }).json()
+          )
+          pageData = resp?.page
+          if (!pageData?.id) {
+            throw new Error('ERR_CREATED_PAGE_NOT_FOUND')
+          }
+        } else {
+          const resp = unwrap(
+            await API_CLIENT.patch(`sites/${siteStore.id}/pages/${this.id}`, {
+              json: body
+            }).json()
+          )
+          pageData = resp?.page
+          if (!pageData?.id) {
+            throw new Error('ERR_PAGE_NOT_FOUND')
+          }
+        }
+
+        // Update page store
+        this.$patch({
+          ...pageData,
+          relations: (pageData.relations ?? []).map((r) =>
+            pick(r, ['id', 'position', 'label', 'caption', 'icon', 'target'])
+          ),
+          /*
+            What the server made of the set, not what was sent: joining another page's translations
+            brings its other members along, so the panel's own list is a request and this is the answer.
+          */
+          localeRelations: (pageData.localeRelations ?? []).map((r) =>
+            pick(r, ['locale', 'path', 'title'])
+          ),
+          tocDepth: pick(pageData.tocDepth, ['min', 'max']),
+          // -> The reply carries the stored render, as any other load does; see `renderProduced`
+          renderProduced: false,
+          // -> What was pending is now what is stored, which is the whole of what a save means here
+          storedProps: storedPropsOf(pageData)
+        })
+
+        /*
+          The site's tags are what its pages carry, so this save is what just changed them -- a tag
+          typed into the properties panel exists from here on, and one taken off the last page carrying
+          it does not. Unconditional: the tags that went up cannot be compared with the ones that were
+          on the page before, since the store held the author's edits long before the save.
+
+          Marked rather than fetched, so the cost falls on the next thing that actually wants the list.
+        */
+        siteStore.staleTags()
+
+        if (editorStore.mode === 'create') {
+          editorStore.$patch({ mode: 'edit' })
+          /*
+            Awaited, because the caller closes the editor the moment this resolves. An unawaited
+            navigation leaves one render of the page view at the route the EDITOR was on -- which for
+            a redirection is a page that reads its own query to decide whether to follow itself, sees
+            the editor's route, and takes its author to the target they just typed in.
+          */
+          await this.router.replace(this.editorExitPath)
+        }
+
+        // Update editor state timestamps
+        const curDate = Temporal.Now.instant()
+        editorStore.$patch({
+          lastChangeTimestamp: curDate,
+          lastSaveTimestamp: curDate,
+          reasonForChange: ''
+        })
+      } catch (err) {
+        console.warn(err)
+        throw err
+      }
+    },
+    /**
+     * Out of the editor: the URL first, then the state.
+     *
+     * Editing has a path of its own (see `editPath`), so closing the editor without leaving that path
+     * would strand the author on an editor URL with no editor on it. The order is deliberate and the
+     * navigation is awaited: a page view drawn at the editor's route reads the query as it stands, and
+     * for a redirection that means following it out from under whoever has just finished writing it.
+     *
+     * Where there is no editor path to leave -- a properties-only edit, which never opened one, or a
+     * suggestion, which is written at the page's own address -- nothing navigates and only the state
+     * changes.
+     */
+    async leaveEditor() {
+      const editorStore = useEditorStore()
+      if (this.router.currentRoute.value.path.startsWith('/_edit')) {
+        await this.router.replace(this.editorExitPath)
+      }
+      editorStore.closeEditor()
+    },
+    /**
+     * Throw away what is unsaved and put the stored page back.
+     *
+     * Leaving the editor's own path is what reloads the page — the page view's route watcher does it —
+     * so the load here is for the case where there is no such path to leave: a property edit discarded
+     * without the editor ever having been opened, where the route does not change and nothing else
+     * would put the page back.
+     */
+    async cancelPageEdit() {
+      const editorStore = useEditorStore()
+      if (this.router.currentRoute.value.path.startsWith('/_edit')) {
+        // -> Awaited for the same reason as in `pageSave`: the editor closes when this resolves
+        await this.router.replace(this.editorExitPath)
+        return
+      }
+      await this.pageLoad({ id: editorStore.originPageId ? editorStore.originPageId : this.id })
+      await this.router.replace(this.editorExitPath)
+    },
+    generateToc() {}
+  }
+})
+
+/** The three header fields a collaborative session compares against, as the server just stated them. */
+function storedPropsOf(pageData) {
+  return {
+    title: pageData.title ?? '',
+    description: pageData.description ?? '',
+    icon: pageData.icon ?? ''
+  }
+}
+
+/**
+ * Turn a refused request back into an error.
+ *
+ * The API client is set up not to throw on 400 (see `boot/api.js`), so a rejected save arrives as a
+ * parsed error envelope rather than an exception — and reading it as a success is how a validation
+ * failure ends up reported as something unrelated.
+ */
+function unwrap(resp) {
+  if (resp?.ok === false) {
+    throw new Error(resp.message || 'An unexpected error occured.')
+  }
+  return resp
+}
+
+/**
+ * The hash a page at this path is addressed by, as `GET /sites/:siteId/pages/:pageIdOrHash` takes it.
+ *
+ * @param {string} path A route path or a stored one; both reduce to the same thing.
+ */
+export function pagePathHash(path) {
+  return fastHash(normalizePath(path))
+}
+
+/**
+ * Reduce a route path to the form the server stores a page under.
+ *
+ * A page is looked up by the hash of its path, so the two sides have to agree on what the path *is*
+ * before hashing it: the router hands over `/docs/intro`, the server holds `docs/intro`, and the site
+ * root is the `home` page rather than an empty path.
+ */
+function normalizePath(path) {
+  // -> NFC as the server's `normalizePagePath` does, or a decomposed spelling hashes as another page
+  const clean = (path ?? '').replace(/^\/+/, '').replace(/\/+$/, '').toLowerCase().normalize('NFC')
+  return clean || 'home'
+}
+
+/**
+ * Fast, non-cryptographic 53-bit hash to encode page paths.
+ * Returns a URL-safe hex string.
+ *
+ * Mirrored on the server as `generatePathHash` in `backend/helpers/common.ts` — the two have to stay
+ * identical, since this is what a page is addressed by.
+ */
+function fastHash(str, seed = 0) {
+  let h1 = 0xdeadbeef ^ seed,
+    h2 = 0x41c6ce57 ^ seed
+  for (let i = 0, ch; i < str.length; i++) {
+    ch = str.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507)
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507)
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+
+  // Convert to a 16-character hexadecimal string
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16)
+}

@@ -1,0 +1,2232 @@
+import path from 'node:path'
+import os from 'node:os'
+import { filesize } from 'filesize'
+import { isNil } from 'es-toolkit/predicate'
+import { gte, sql } from 'drizzle-orm'
+import {
+  groups as groupsTable,
+  hooks as hooksTable,
+  pages as pagesTable,
+  tags as tagsTable,
+  users as usersTable
+} from '../db/schema.ts'
+import maintenance from '../core/maintenance.ts'
+import { audit } from '../helpers/audit.ts'
+import { COMMENT_MAX_LENGTH, COMMENT_MIN_LENGTH, HANDLE_PATTERN } from '../models/comments.ts'
+import type { DatedCommentInput } from '../models/comments.ts'
+import { SAMPLE_ACCOUNT_DOMAIN } from '../models/users.ts'
+import { PAGE_PROBLEM_CHECKS } from '../models/pageProblems.ts'
+import { purgeTimeframes } from '../models/pageHistory.ts'
+import type { PurgeTimeframe } from '../models/pageHistory.ts'
+import type { FastifyInstance } from 'fastify'
+
+/**
+ * The tag the admin area's Generate Sample Content puts on every page it writes, and the only thing
+ * Purge Sample Content goes looking for.
+ *
+ * **Also written in `frontend/src/helpers/sampleContent.js`**, which is what does the generating —
+ * the three workspaces share no package, so the two have to be kept in step by hand. Changing one
+ * without the other leaves content that nothing will clean up.
+ */
+const SAMPLE_CONTENT_TAG = 'test'
+
+/** One comment of the sample discussion, as `POST /sample-content/comments` takes it. */
+interface SampleComment {
+  author?: string
+  guestName?: string
+  content: string
+  createdAt: string
+  editedAt?: string
+}
+
+/** The JSON Schema of a {@link SampleComment}, shared by the comments that start a thread and their replies. */
+const sampleCommentProperties = {
+  author: {
+    type: 'string',
+    pattern: HANDLE_PATTERN.source,
+    description: 'The handle of one of `authors`. Leave out, and give `guestName`, for a guest.'
+  },
+  guestName: {
+    type: 'string',
+    minLength: 1,
+    maxLength: 255,
+    description: 'The name a guest comment is posted under.'
+  },
+  content: {
+    type: 'string',
+    minLength: COMMENT_MIN_LENGTH,
+    maxLength: COMMENT_MAX_LENGTH
+  },
+  createdAt: {
+    type: 'string',
+    format: 'date-time'
+  },
+  editedAt: {
+    type: 'string',
+    format: 'date-time',
+    description: 'When it was last changed, for a comment that is to read as edited.'
+  }
+} as const
+
+/**
+ * Every instance connected to this database, with how it is using the connection pool.
+ *
+ * There is no instance registry: an instance is only known by the connections it holds, which it
+ * labels `Wiki.js - <instance id>:<purpose>`. Two of those purposes hold a listener rather than
+ * doing query work, so they are counted apart.
+ *
+ * Shared by the list route and the dashboard count, so that the number on the dashboard is the
+ * number of rows the instances page shows.
+ */
+async function getInstances(): Promise<Record<string, any>[]> {
+  const instRaw = await WIKI.db.execute(
+    sql`SELECT usename, client_addr, application_name, backend_start, state_change FROM pg_stat_activity WHERE datname = ${WIKI.dbManager.dbName} AND application_name LIKE 'Wiki.js%'`
+  )
+  const insts: Record<string, any> = {}
+  for (const inst of instRaw.rows as any[]) {
+    const instId = inst.application_name.substring(10, 20)
+    const conType = [':MAIN', ':WORKER'].some((ct) => inst.application_name.endsWith(ct))
+      ? 'main'
+      : 'sub'
+    // -> `db.execute()` with a raw SQL template returns timestamps as postgres-format strings
+    //    (e.g. `2026-07-25 13:17:36.230177+00`) rather than Dates, which is what the previous
+    //    `DateTime.fromSQL()` call was for. Temporal.Instant.from parses that format as-is,
+    //    including the space separator and the hour-only `+00` offset. Rendered with
+    //    millisecond precision to match the timestamps produced elsewhere.
+    inst.backend_start = Temporal.Instant.from(inst.backend_start).toString({
+      smallestUnit: 'millisecond'
+    })
+    inst.state_change = Temporal.Instant.from(inst.state_change).toString({
+      smallestUnit: 'millisecond'
+    })
+    const curInst = insts[instId] ?? {
+      activeConnections: 0,
+      activeListeners: 0,
+      dbFirstSeen: inst.backend_start,
+      dbLastSeen: inst.state_change
+    }
+    insts[instId] = {
+      id: instId,
+      activeConnections:
+        conType === 'main' ? curInst.activeConnections + 1 : curInst.activeConnections,
+      activeListeners: conType === 'sub' ? curInst.activeListeners + 1 : curInst.activeListeners,
+      dbUser: inst.usename,
+      dbFirstSeen:
+        curInst.dbFirstSeen > inst.backend_start ? inst.backend_start : curInst.dbFirstSeen,
+      dbLastSeen: curInst.dbLastSeen < inst.state_change ? inst.state_change : curInst.dbLastSeen,
+      ip: inst.client_addr
+    }
+  }
+  return Object.values(insts)
+}
+
+/**
+ * System API Routes
+ */
+async function routes(app: FastifyInstance) {
+  /**
+   * SYSTEM INFO
+   */
+  app.get(
+    '/info',
+    {
+      config: {
+        permissions: ['access:admin']
+      },
+      schema: {
+        summary: 'System Info',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'System Info',
+            type: 'object',
+            properties: {
+              activeWorkers: {
+                type: 'number',
+                description:
+                  'Jobs running right now on every instance combined, one worker slot each.'
+              },
+              assetsSize: {
+                type: 'number',
+                description: 'Combined size of every asset across all sites, in bytes.'
+              },
+              assetsTotal: {
+                type: 'number',
+                description: 'Assets across all sites.'
+              },
+              commentsTotal: {
+                type: 'number',
+                description:
+                  'Comments across all sites, not counting the placeholders deleted comments leave behind.'
+              },
+              configFile: {
+                type: 'string'
+              },
+              cpuCores: {
+                type: 'number'
+              },
+              currentVersion: {
+                type: 'string'
+              },
+              dbHost: {
+                type: 'string'
+              },
+              dbVersion: {
+                type: 'string'
+              },
+              groupsTotal: {
+                type: 'number'
+              },
+              hostname: {
+                type: 'string'
+              },
+              httpPort: {
+                type: 'number'
+              },
+              instancesTotal: {
+                type: 'number',
+                description: 'Instances currently connected to this database.'
+              },
+              isMailConfigured: {
+                type: 'boolean'
+              },
+              isApiEnabled: {
+                type: 'boolean',
+                description: 'Whether API keys are accepted.'
+              },
+              isMetricsEnabled: {
+                type: 'boolean',
+                description: 'Whether the Prometheus metrics endpoint is turned on.'
+              },
+              isScimEnabled: {
+                type: 'boolean',
+                description:
+                  'Whether the SCIM provisioning endpoint is turned on. Note that it cannot authenticate anybody unless `isApiEnabled` is also true, since a connector arrives holding an API key.'
+              },
+              isSchedulerHealthy: {
+                type: 'boolean',
+                description:
+                  'False when no instance has refreshed the scheduler cron lock recently, i.e. scheduled jobs are no longer being queued.'
+              },
+              latestVersion: {
+                type: 'string'
+              },
+              latestVersionReleaseDate: {
+                type: 'string',
+                format: 'date-time'
+              },
+              loginsPastDay: {
+                type: 'number'
+              },
+              nodeVersion: {
+                type: 'string'
+              },
+              operatingSystem: {
+                type: 'string'
+              },
+              pagesTotal: {
+                type: 'number'
+              },
+              platform: {
+                type: 'string'
+              },
+              ramTotal: {
+                type: 'string'
+              },
+              tagsTotal: {
+                type: 'number'
+              },
+              upgradeCapable: {
+                type: 'boolean'
+              },
+              usersTotal: {
+                type: 'number'
+              },
+              webhooksTotal: {
+                type: 'number'
+              },
+              workingDirectory: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => {
+      const assetsTotals = await WIKI.models.assets.totals()
+      return {
+        activeWorkers: await WIKI.models.jobs.countActive(),
+        assetsSize: assetsTotals.bytes,
+        assetsTotal: assetsTotals.count,
+        commentsTotal: await WIKI.models.comments.countAll(),
+        configFile: path.join(process.cwd(), 'config.yml'),
+        cpuCores: os.cpus().length,
+        currentVersion: WIKI.version,
+        dbHost: WIKI.config.db.host,
+        dbVersion: WIKI.dbManager.VERSION,
+        groupsTotal: await WIKI.db.$count(groupsTable),
+        hostname: os.hostname(),
+        httpPort: 0,
+        instancesTotal: (await getInstances()).length,
+        isApiEnabled: WIKI.config.api.isEnabled === true,
+        isMailConfigured: WIKI.config?.mail?.host?.length > 2,
+        isMetricsEnabled: WIKI.config.metrics.isEnabled === true,
+        isScimEnabled: WIKI.models.scim.isEnabled(),
+        isSchedulerHealthy: await WIKI.models.jobs.isHealthy(),
+        latestVersion: WIKI.config.update.version,
+        latestVersionReleaseDate: WIKI.config.update.versionDate,
+        loginsPastDay: await WIKI.db.$count(
+          usersTable,
+          gte(usersTable.lastLoginAt, sql`NOW() - INTERVAL '1 DAY'`)
+        ),
+        nodeVersion: process.version.substring(1),
+        operatingSystem: `${os.type()} (${os.platform()}) ${os.release()} ${os.arch()}`,
+        pagesTotal: await WIKI.db.$count(pagesTable),
+        platform: os.platform(),
+        ramTotal: filesize(os.totalmem()),
+        tagsTotal: await WIKI.db.$count(tagsTable),
+        upgradeCapable: !isNil(process.env.UPGRADE_COMPANION),
+        usersTotal: await WIKI.db.$count(usersTable),
+        webhooksTotal: await WIKI.db.$count(hooksTable),
+        workingDirectory: process.cwd()
+      }
+    }
+  )
+
+  /**
+   * SYSTEM FLAGS
+   */
+  app.get(
+    '/flags',
+    {
+      config: {
+        publicAccess: true
+      },
+      schema: {
+        summary: 'System Flags',
+        description:
+          'Readable without authentication: the frontend needs `experimental` before anyone has logged in, to know which unfinished features to reveal. A flag must therefore never carry anything sensitive.',
+        tags: ['System'],
+        response: {
+          200: { $ref: 'SystemFlags#' }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.flags.getFlags()
+    }
+  )
+
+  /**
+   * UPDATE SYSTEM FLAGS
+   */
+  app.put<{ Body: Record<string, any> }>(
+    '/flags',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Update the system flags',
+        description:
+          'Accepts any subset of the flags. All of them take effect immediately, without a restart: `authDebug` and `sqlLog` write to the server log at info level, and `experimental` is picked up by the frontend on its next load.',
+        tags: ['System'],
+        body: { $ref: 'SystemFlags#' },
+        response: {
+          200: {
+            description: 'System flags updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const patch = WIKI.models.flags.pickFlags(req.body)
+      if (Object.keys(patch).length < 1) {
+        return reply.badRequest('No system flags provided to update.')
+      }
+      if (!(await WIKI.models.flags.updateFlags(patch))) {
+        return reply.internalServerError('Failed to save the system flags.')
+      }
+
+      await audit(req, 'admin', 'updateFlags', patch)
+
+      return {
+        ok: true,
+        message: 'System flags updated successfully.'
+      }
+    }
+  )
+
+  /**
+   * GET SECURITY CONFIGURATION
+   */
+  app.get(
+    '/security',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the security configuration',
+        description:
+          'Response headers, CSP, HSTS, CORS and `uploadMaxFileSize` are applied when the HTTP server starts, so changing those takes effect on the next restart. The rest is read per request.',
+        tags: ['System'],
+        response: {
+          200: { $ref: 'SecurityConfig#' }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.security.getConfig()
+    }
+  )
+
+  /**
+   * UPDATE SECURITY CONFIGURATION
+   */
+  app.put<{ Body: Record<string, any> }>(
+    '/security',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Update the security configuration',
+        description:
+          'Accepts any subset of the fields. Response headers, CSP, HSTS, CORS and `uploadMaxFileSize` are read when the HTTP server starts and therefore apply after a restart; `trustProxy`, `forceAssetDownload` and the rate limit are read per request and apply at once.',
+        tags: ['System'],
+        body: { $ref: 'SecurityConfig#' },
+        response: {
+          200: {
+            description: 'Security configuration updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const patch = WIKI.models.security.pickFields(req.body)
+      if (Object.keys(patch).length < 1) {
+        return reply.badRequest('No security settings provided to update.')
+      }
+
+      const invalid = WIKI.models.security.validate(patch)
+      if (invalid) {
+        return reply.badRequest(invalid)
+      }
+
+      if (!(await WIKI.models.security.updateConfig(patch))) {
+        return reply.internalServerError('Failed to save the security configuration.')
+      }
+
+      // -> The security settings are the one configuration blob recorded in full: none of them is a
+      //    secret, and what a CSP or a rate limit was set to is precisely what gets asked about later
+      await audit(req, 'admin', 'updateSecurity', patch)
+
+      return {
+        ok: true,
+        message: 'Security configuration updated successfully.'
+      }
+    }
+  )
+
+  /**
+   * GET SEARCH CONFIGURATION
+   */
+  app.get(
+    '/search',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the search configuration',
+        description:
+          'Search is postgres full-text. `availableDictionaries` lists the text search configurations this database has, which is what a locale may be mapped to.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Search configuration',
+            type: 'object',
+            properties: {
+              termHighlighting: {
+                type: 'boolean'
+              },
+              dictOverrides: {
+                type: 'object',
+                description:
+                  'Locale code to postgres dictionary, e.g. `{ "en": "english" }`. Overrides the built-in mapping.',
+                additionalProperties: { type: 'string' }
+              },
+              availableDictionaries: {
+                type: 'array',
+                description: 'Dictionary names this postgres installation knows.',
+                items: { type: 'string' }
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => {
+      return {
+        ...WIKI.models.search.getConfig(),
+        availableDictionaries: await WIKI.models.search.getAvailableDictionaries()
+      }
+    }
+  )
+
+  /**
+   * UPDATE SEARCH CONFIGURATION
+   */
+  app.put<{ Body: { termHighlighting?: boolean; dictOverrides?: Record<string, string> } }>(
+    '/search',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Update the search configuration',
+        description:
+          'Every dictionary named in `dictOverrides` must exist in this database, otherwise indexing would fail later, long after the setting was accepted. Changing a mapping affects pages the next time they are indexed — rebuild the index to apply it to existing content.',
+        tags: ['System'],
+        body: {
+          type: 'object',
+          properties: {
+            termHighlighting: {
+              type: 'boolean'
+            },
+            dictOverrides: {
+              type: 'object',
+              description: 'Locale code to postgres dictionary. Replaces the stored mapping.',
+              additionalProperties: { type: 'string' }
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Search configuration updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      if (req.body.termHighlighting === undefined && req.body.dictOverrides === undefined) {
+        return reply.badRequest('No search settings provided to update.')
+      }
+
+      if (req.body.dictOverrides) {
+        const available = await WIKI.models.search.getAvailableDictionaries()
+        for (const [locale, dictionary] of Object.entries(req.body.dictOverrides)) {
+          if (!/^[a-z]{2,3}(?:[-_][A-Za-z]{2,4})?$/.test(locale)) {
+            return reply.badRequest(`"${locale}" is not a valid locale code.`)
+          }
+          if (!available.includes(dictionary)) {
+            return reply.badRequest(
+              `"${dictionary}" is not a text search dictionary in this database.`
+            )
+          }
+        }
+      }
+
+      const previousConfig = WIKI.config.search
+      WIKI.config.search = {
+        ...previousConfig,
+        ...(req.body.termHighlighting !== undefined && {
+          termHighlighting: req.body.termHighlighting
+        }),
+        ...(req.body.dictOverrides !== undefined && { dictOverrides: req.body.dictOverrides })
+      }
+
+      if (!(await WIKI.configSvc.saveToDb(['search']))) {
+        WIKI.config.search = previousConfig
+        return reply.internalServerError('Failed to save the search configuration.')
+      }
+
+      await audit(req, 'admin', 'updateSearchConfig', {
+        ...(req.body.termHighlighting !== undefined
+          ? { termHighlighting: req.body.termHighlighting }
+          : {}),
+        ...(req.body.dictOverrides !== undefined ? { dictOverrides: req.body.dictOverrides } : {})
+      })
+
+      return {
+        ok: true,
+        message: 'Search configuration updated successfully.'
+      }
+    }
+  )
+
+  /**
+   * REBUILD SEARCH INDEX
+   */
+  app.post(
+    '/search/rebuild',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Rebuild the search index',
+        description:
+          'Queues a job that recomputes the search vector of every page from its stored content, using the dictionary mapping in force. Runs in the background: the response only says the job was queued.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Rebuild queued successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              id: {
+                type: 'string',
+                format: 'uuid',
+                description: 'ID of the queued job, which the scheduler view lists.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const added = await WIKI.scheduler.addJob({ task: 'rebuildSearchIndex' })
+      if (!added?.id) {
+        return reply.internalServerError('The scheduler could not queue the rebuild.')
+      }
+
+      await audit(req, 'admin', 'rebuildSearchIndex', { jobId: added.id })
+
+      return {
+        ok: true,
+        message: 'Search index rebuild queued successfully.',
+        id: added.id
+      }
+    }
+  )
+
+  /**
+   * LIST EXTENSIONS
+   */
+  app.get(
+    '/extensions',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'List optional extensions',
+        description:
+          'Third-party tooling that unlocks extra functionality, with whether each one is present on this system. Detection runs per request, so installing a tool shows up without a restart.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'List of extensions',
+            type: 'array',
+            items: { $ref: 'Extension#' }
+          }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.extensions.getExtensions()
+    }
+  )
+
+  /**
+   * INSTALL EXTENSION
+   */
+  app.post<{ Params: { extensionKey: string } }>(
+    '/extensions/:extensionKey/install',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Install or reinstall an extension',
+        description:
+          'Only extensions flagged `isInstallable` can be installed from here — the npm packages, which are Sharp and Puppeteer. For Sharp this is mostly a repair: it already ships as an optional dependency, and refetching it replaces a prebuilt binary that is missing or does not match this OS and architecture. Puppeteer is not shipped at all, so this is a first install, and it fetches a Chromium build of a few hundred megabytes unless the server points at one it already has through `PUPPETEER_EXECUTABLE_PATH`. Git and Pandoc come from the operating system and answer 409 pointing at the documentation. Runs npm and can take minutes — allow the request a correspondingly long timeout.',
+        tags: ['System'],
+        params: {
+          type: 'object',
+          properties: {
+            extensionKey: {
+              type: 'string',
+              maxLength: 255
+            }
+          },
+          required: ['extensionKey']
+        },
+        response: {
+          200: {
+            description: 'Extension installed successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              restartRequired: {
+                type: 'boolean',
+                description:
+                  'True when this server already tried and failed to load the module. Node replays a failed module load for the life of the process, so the repaired files cannot be used until the server restarts.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const definition = WIKI.models.extensions.getDefinition(req.params.extensionKey)
+      if (!definition) {
+        return reply.notFound('Extension does not exist.')
+      }
+      if (!WIKI.models.extensions.isCompatible(definition)) {
+        return reply.conflict('This extension is not compatible with this system.')
+      }
+      if (definition.isInstallable !== true) {
+        return reply.conflict(
+          `${definition.title} must be installed manually. See the documentation for instructions.`
+        )
+      }
+
+      try {
+        await WIKI.models.extensions.install(definition)
+      } catch (err: any) {
+        // -> The message carries npm's own output, which is the only thing that explains a failure
+        //    like a missing build toolchain. An administrator is the only caller.
+        return reply.internalServerError(err.message)
+      }
+
+      // -> A fresh install is usable at once, since nothing has tried to load it yet. Repairing one this
+      //    process already choked on is a different story, and saying so beats leaving an administrator
+      //    to wonder why nothing changed.
+      const restartRequired = WIKI.models.extensions.hasLoadFailed(definition)
+
+      await audit(req, 'admin', 'installExtension', {
+        extensionKey: req.params.extensionKey,
+        title: definition.title,
+        restartRequired
+      })
+
+      return {
+        ok: true,
+        message: restartRequired
+          ? `${definition.title} was reinstalled, but this server has to be restarted before it can use it.`
+          : `${definition.title} installed successfully.`,
+        restartRequired
+      }
+    }
+  )
+
+  /**
+   * GET API STATE
+   */
+  app.get(
+    '/api',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the API state',
+        description:
+          'Whether API keys are accepted. While this is off, every request presenting a key is rejected, no matter how valid the key is.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'API state',
+            type: 'object',
+            properties: {
+              isEnabled: {
+                type: 'boolean'
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => {
+      return { isEnabled: WIKI.config.api.isEnabled === true }
+    }
+  )
+
+  /**
+   * SET API STATE
+   */
+  app.put<{ Body: { isEnabled: boolean } }>(
+    '/api',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Turn the API on or off',
+        description:
+          'Turning it off stops every API key from authenticating, without revoking any of them. Session-authenticated requests, i.e. the admin area itself, are unaffected.',
+        tags: ['System'],
+        body: {
+          type: 'object',
+          required: ['isEnabled'],
+          properties: {
+            isEnabled: {
+              type: 'boolean'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'API state updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              isEnabled: {
+                type: 'boolean'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const previousConfig = WIKI.config.api
+      WIKI.config.api = { ...previousConfig, isEnabled: req.body.isEnabled }
+
+      if (!(await WIKI.configSvc.saveToDb(['api']))) {
+        WIKI.config.api = previousConfig
+        return reply.internalServerError('Failed to save the API state.')
+      }
+
+      await audit(req, 'admin', 'updateApiState', { isEnabled: req.body.isEnabled })
+
+      return {
+        ok: true,
+        message: req.body.isEnabled ? 'API enabled successfully.' : 'API disabled successfully.',
+        isEnabled: req.body.isEnabled
+      }
+    }
+  )
+
+  /**
+   * GET METRICS CONFIGURATION
+   */
+  app.get(
+    '/metrics',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the metrics endpoint configuration',
+        description:
+          'Whether the Prometheus metrics endpoint is turned on, the path it answers at, and who may scrape it without credentials.',
+        tags: ['System'],
+        response: {
+          200: { $ref: 'MetricsConfig#' }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.metrics.getConfig()
+    }
+  )
+
+  /**
+   * UPDATE METRICS CONFIGURATION
+   */
+  app.put<{ Body: Record<string, any> }>(
+    '/metrics',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Update the metrics endpoint configuration',
+        description:
+          'Accepts any subset of the fields, and applies at once on every instance — nothing here is read at boot. While the endpoint is enabled it takes its path over from the page tree, so a wiki page at that path becomes unreachable until it is turned off again.',
+        tags: ['System'],
+        body: { $ref: 'MetricsConfig#' },
+        response: {
+          200: {
+            description: 'Metrics endpoint configuration updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const patch = WIKI.models.metrics.pickFields(req.body)
+      if (Object.keys(patch).length < 1) {
+        return reply.badRequest('No valid metrics setting was provided.')
+      }
+
+      const invalid = WIKI.models.metrics.validate(patch)
+      if (invalid) {
+        return reply.badRequest(invalid)
+      }
+
+      if (!(await WIKI.models.metrics.updateConfig(patch))) {
+        return reply.internalServerError('Failed to save the metrics configuration.')
+      }
+
+      // -> Fields rather than values, as the other configuration routes do. `isEnabled` is the
+      //    exception because whether the endpoint is open at all is the part that gets asked about.
+      await audit(req, 'admin', 'updateMetricsState', {
+        fields: Object.keys(patch).sort(),
+        ...(patch.isEnabled === undefined ? {} : { isEnabled: patch.isEnabled })
+      })
+
+      return {
+        ok: true,
+        message: 'Metrics configuration saved successfully.'
+      }
+    }
+  )
+
+  /**
+   * GET SCIM CONFIGURATION
+   */
+  app.get(
+    '/scim',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the SCIM provisioning configuration',
+        description:
+          'Whether the SCIM 2.0 endpoint at `/_scim/v2` is turned on, and how it behaves. Instance-wide: users and groups are not per site, so neither is provisioning.',
+        tags: ['System'],
+        response: {
+          200: { $ref: 'ScimConfig#' }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.scim.getConfig()
+    }
+  )
+
+  /**
+   * UPDATE SCIM CONFIGURATION
+   */
+  app.put<{ Body: Record<string, any> }>(
+    '/scim',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Update the SCIM provisioning configuration',
+        description:
+          'Accepts any subset of the fields, and applies at once on every instance — nothing here is read at boot. Turning the endpoint on does not by itself let anything in: a connector also needs an API key belonging to a group that holds `manage:scim`.',
+        tags: ['System'],
+        body: { $ref: 'ScimConfig#' },
+        response: {
+          200: {
+            description: 'SCIM configuration updated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const patch = WIKI.models.scim.pickFields(req.body)
+      if (Object.keys(patch).length < 1) {
+        return reply.badRequest('No valid SCIM setting was provided.')
+      }
+
+      const invalid = WIKI.models.scim.validate(patch)
+      if (invalid) {
+        return reply.badRequest(invalid)
+      }
+
+      if (!(await WIKI.models.scim.updateConfig(patch))) {
+        return reply.internalServerError('Failed to save the SCIM configuration.')
+      }
+
+      // -> Fields rather than values, with `isEnabled` spelled out for the same reason the metrics
+      //    route spells it out: whether a directory may write to the user list is the part that gets
+      //    asked about afterwards.
+      await audit(req, 'admin', 'updateScimState', {
+        fields: Object.keys(patch).sort(),
+        ...(patch.isEnabled === undefined ? {} : { isEnabled: patch.isEnabled })
+      })
+
+      return {
+        ok: true,
+        message: 'SCIM configuration saved successfully.'
+      }
+    }
+  )
+
+  /**
+   * GET SCIM STATUS
+   */
+  app.get(
+    '/scim/status',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Get the SCIM provisioning status',
+        description:
+          'How many users and groups a directory currently owns, and the last SCIM request this instance answered.',
+        tags: ['System'],
+        response: {
+          200: { $ref: 'ScimStatus#' }
+        }
+      }
+    },
+    async () => {
+      return WIKI.models.scim.getStats()
+    }
+  )
+
+  /**
+   * PREVIEW THE METRICS EXPOSITION
+   */
+  app.get<{ Querystring: { includeRuntime?: boolean; includeWiki?: boolean } }>(
+    '/metrics/preview',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Preview the metrics exposition',
+        description:
+          'The Prometheus text a scrape would be answered with, for the admin area to show. Works whether or not the endpoint is enabled, and ignores the path and the anonymous-access settings entirely — this is the API talking, not the endpoint. `includeRuntime` and `includeWiki` override the stored settings so an unsaved selection can be previewed; either one left out falls back to what is stored.',
+        tags: ['System'],
+        querystring: {
+          type: 'object',
+          properties: {
+            includeRuntime: {
+              type: 'boolean'
+            },
+            includeWiki: {
+              type: 'boolean'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'The exposition',
+            type: 'object',
+            properties: {
+              contentType: {
+                type: 'string',
+                description: 'The `Content-Type` the endpoint answers with.'
+              },
+              body: {
+                type: 'string',
+                description: 'The exposition itself. Empty when neither group is included.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      try {
+        return await WIKI.models.metrics.render({
+          includeRuntime: req.query.includeRuntime,
+          includeWiki: req.query.includeWiki
+        })
+      } catch (err: any) {
+        WIKI.logger.warn(`Failed to collect metrics for preview: ${err.message}`)
+        return reply.internalServerError('Failed to collect metrics.')
+      }
+    }
+  )
+
+  /**
+   * LIST SYSTEM INSTANCES
+   */
+  app.get(
+    '/instances',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'List System Instances',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'List of all system instances',
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: {
+                  type: 'string'
+                },
+                activeConnections: {
+                  type: 'number'
+                },
+                activeListeners: {
+                  type: 'number'
+                },
+                dbUser: {
+                  type: 'string'
+                },
+                dbFirstSeen: {
+                  type: 'string',
+                  format: 'date-time'
+                },
+                dbLastSeen: {
+                  type: 'string',
+                  format: 'date-time'
+                },
+                ip: {
+                  type: 'string'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => {
+      return getInstances()
+    }
+  )
+
+  /**
+   * DISCONNECT WEBSOCKET SESSIONS
+   */
+  app.post(
+    '/websockets/disconnect',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Close every websocket connection, on every instance',
+        description:
+          'The sockets are the editors of live collaborative editing (`/_collab`) and the admin terminal’s log stream (`/_terminal`). Closing one is not a refusal: the code sent is a plain "come back", so an editor reconnects on its own and picks up the room it was in, and its unsaved text survives as long as somebody else is still in that room. Every other instance is told to do the same over the event bus, and does it as it hears it — `count` is this instance’s own, since a socket is held by the instance the browser reached and nothing reports back.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Websocket connections closed successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Connections that were open on this instance and have been closed.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const count = maintenance.disconnectWebsockets()
+      WIKI.events.outbound.emit('disconnectWebsockets')
+
+      await audit(req, 'admin', 'disconnectWebsockets', { count })
+
+      return {
+        ok: true,
+        message: `Closed ${count} websocket connection(s) on this instance.`,
+        count
+      }
+    }
+  )
+
+  /**
+   * FLUSH CACHE
+   */
+  app.post(
+    '/cache/flush',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Flush the caches, on every instance',
+        description:
+          'Throws away everything an instance holds that the database is the real copy of: the file and icon caches, in memory and on disk, and the site, group, page-rule and locale state that answers every request. Nothing is lost and nothing is disabled — what is read on every request is refilled before this answers, and the rest as it is asked for again. Every other instance is told to do the same over the event bus, and does it as it hears it.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Cache flushed successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      await maintenance.flushCaches()
+      WIKI.events.outbound.emit('flushCaches')
+
+      await audit(req, 'admin', 'flushCache', {})
+
+      return {
+        ok: true,
+        message: 'The cache has been flushed.'
+      }
+    }
+  )
+
+  /**
+   * GET API KEY CERTIFICATE STATE
+   */
+  app.get(
+    '/certificates',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'When the API key signing certificates were generated',
+        description:
+          'The moment the current keypair came into being — at install, or the last time an administrator regenerated it. Every key issued before it was signed by a keypair that no longer exists and cannot authenticate, which is what `isInvalidated` on a key reports.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Certificate state',
+            type: 'object',
+            properties: {
+              generatedAt: {
+                type: 'string',
+                format: 'date-time',
+                description: 'RFC 3339 Date Time'
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => {
+      return { generatedAt: WIKI.models.apiKeys.certificatesGeneratedAt() }
+    }
+  )
+
+  /**
+   * REGENERATE API KEY CERTIFICATES
+   */
+  app.post(
+    '/certificates',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Replace the API key signing certificates',
+        description:
+          'Generates a new keypair and a new passphrase for it. An API key is a token signed with that keypair, so every key ever issued stops authenticating at once, on every instance — this is what takes back a key that has escaped and cannot be revoked one at a time. The key rows are left as they are, still listed and still not revoked: what has to happen next is that each one is reissued. Logins are unaffected — session cookies are signed with a secret of their own.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Certificates regenerated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              invalidatedKeys: {
+                type: 'number',
+                description:
+                  'Keys that were neither revoked nor expired, and have just stopped working.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const invalidatedKeys = await WIKI.models.apiKeys.regenerateCertificates()
+      if (invalidatedKeys === null) {
+        return reply.internalServerError('Failed to save the new certificates.')
+      }
+
+      await audit(req, 'admin', 'regenerateCertificates', { invalidatedKeys })
+
+      return {
+        ok: true,
+        message: `Certificates regenerated successfully. ${invalidatedKeys} API key(s) will have to be reissued.`,
+        invalidatedKeys
+      }
+    }
+  )
+
+  /**
+   * PURGE REVOKED API KEYS
+   */
+  app.post(
+    '/api-keys/purge',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Delete every revoked API key',
+        description:
+          'Clears revoked keys out of the list for good. Nothing about access changes — a revoked key already authenticates nothing — so this trades the record that the key ever existed for a shorter list. Keys that are merely invalidated are kept: one of those is a key nobody has made a decision about, and its row is what tells its owner to reissue it.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Revoked keys purged successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Keys deleted.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const count = await WIKI.models.apiKeys.purgeRevoked()
+
+      await audit(req, 'admin', 'purgeApiKeys', { count })
+
+      return {
+        ok: true,
+        message: `Purged ${count} revoked API key(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * INVALIDATE USER SESSIONS
+   */
+  app.post(
+    '/sessions/invalidate',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Rotate the session secret and end every session',
+        description:
+          'Logs everybody out, this caller included, and gives @fastify/session a new secret to sign cookies with. The two happen together on purpose: ending the sessions takes effect immediately and everywhere, since they are rows every instance shares, while the new secret is only picked up when an instance restarts — the plugins are handed it at startup. API keys are unaffected; their keypair carries its own passphrase.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Sessions invalidated successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Sessions that were open and have been ended.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const count = await WIKI.models.sessions.rotateSecret()
+      if (count === null) {
+        return reply.internalServerError('Failed to save the new session secret.')
+      }
+
+      // -> Before the session goes, since that is where the entry's actor comes from
+      await audit(req, 'admin', 'invalidateSessions', { count })
+
+      /*
+        This request's own session, which the rows above no longer include but which would come
+        straight back without this: @fastify/session writes the session it is holding as the response
+        is sent, so deleting the row from under it only means it is written again a moment later, and
+        the one account that would stay logged in is the one that asked for everybody to be logged
+        out. Destroying it detaches it from the request, which is what that hook skips on.
+      */
+      await req.session.destroy()
+
+      return {
+        ok: true,
+        message: `Ended ${count} session(s) and rotated the session secret.`,
+        count
+      }
+    }
+  )
+
+  /**
+   * PURGE PAGE HISTORY
+   */
+  app.post<{ Body: { olderThan: PurgeTimeframe } }>(
+    '/history/purge',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Purge page history older than a timeframe',
+        description:
+          'Deletes every version older than the cutoff, on every site. Pages themselves are untouched — a page row holds what it says now — so this shortens timelines and takes away what a page can be rolled back to, nothing more. With one exception: the versions of a page that was DELETED are all that is left of it, so purging past the day it went is what finally discards it. Nothing here can be undone.',
+        tags: ['System'],
+        body: {
+          type: 'object',
+          required: ['olderThan'],
+          properties: {
+            olderThan: {
+              type: 'string',
+              enum: Object.keys(purgeTimeframes),
+              description: 'How far back to keep. Everything older than this is deleted.'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Page history purged successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Versions deleted.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const count = await WIKI.models.pageHistory.purge(req.body.olderThan)
+
+      // -> Worth recording precisely because of what it destroys: the versions this took away are
+      //    what page audit entries older than it point at
+      await audit(req, 'admin', 'purgePageHistory', { olderThan: req.body.olderThan, count })
+
+      return {
+        ok: true,
+        message: `Purged ${count} page version(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * PURGE SAMPLE CONTENT
+   *
+   * The other half of the admin area's Generate Sample Content, which is a development convenience:
+   * it fills a fresh instance with pages to look at instead of making somebody write dummy content to
+   * test against. Every page it writes carries the `test` tag, and this deletes exactly those.
+   *
+   * The tag is the whole of the contract, which is what makes this usable on content nothing here
+   * generated — tag a page `test` by hand and this takes it too. Said plainly in the description
+   * rather than left as a surprise.
+   */
+  app.post<{ Body: { siteId: string } }>(
+    '/sample-content/purge',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Delete every page tagged `test` on a site',
+        description:
+          "The counterpart to the admin area's Generate Sample Content, which tags everything it writes `test`. Membership of that tag is the only thing consulted, so a page tagged by hand is deleted too. Folders are left standing: they carry no tags, and one somebody made themselves must not go because a sample page was filed in it. Each page is deleted the way the file manager deletes one — its history records the deletion, and its copy on every storage target goes with it. Its comments go with it, and then so does every sample account (see `POST /system/sample-content/comments`) that no remaining comment is credited to.",
+        tags: ['System'],
+        body: {
+          type: 'object',
+          required: ['siteId'],
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Sample content purged successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Pages deleted.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      if (!WIKI.sites[req.body.siteId]) {
+        return reply.badRequest('This site does not exist.')
+      }
+      const count = await WIKI.models.pages.deletePagesByTag(req.body.siteId, SAMPLE_CONTENT_TAG, {
+        id: req.session.user!.id,
+        permissions: req.session.permissions ?? []
+      })
+      // -> Their comments went with the pages, so the accounts that wrote only those are unused now
+      const accounts = await WIKI.models.users.deleteUnusedSampleAccounts()
+      await audit(req, 'admin', 'purgeSampleContent', { siteId: req.body.siteId, count, accounts })
+
+      return {
+        ok: true,
+        message: `Purged ${count} page(s) tagged ${SAMPLE_CONTENT_TAG} and ${accounts} sample account(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * GENERATE SAMPLE COMMENTS
+   *
+   * The discussion on the sample content's talk page. Generate Sample Content writes its pages through
+   * the ordinary page endpoint, but a comment posted through the ordinary comment endpoint is written
+   * by whoever is signed in, and a talk page with one participant is not what a talk page looks like.
+   * So the threads are handed over whole, with who wrote each comment and when, and stored as given.
+   *
+   * The authors are real accounts — see `users.ensureSampleAccounts` for why, and for why none of them
+   * can sign in. Purge Sample Content deletes them once the comments they wrote are gone.
+   *
+   * Nothing is notified and no webhook fires: nobody posted anything.
+   */
+  app.post<{
+    Body: {
+      siteId: string
+      pageId: string
+      authors: Array<{ handle: string; name: string }>
+      threads: Array<SampleComment & { replies?: SampleComment[] }>
+    }
+  }>(
+    '/sample-content/comments',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Write the sample discussion onto a page',
+        description: `Used by the admin area's Generate Sample Content. Creates each author as an account that cannot sign in (no password, unverified), under the reserved \`${SAMPLE_ACCOUNT_DOMAIN}\` address domain (an existing one is reused), then stores the threads with the dates given. Replies are one level deep, as everywhere else. Nothing is notified. Purge Sample Content deletes these accounts once no comment is credited to them.`,
+        tags: ['System'],
+        body: {
+          type: 'object',
+          required: ['siteId', 'pageId', 'authors', 'threads'],
+          properties: {
+            siteId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            pageId: {
+              type: 'string',
+              format: 'uuid'
+            },
+            authors: {
+              type: 'array',
+              maxItems: 50,
+              items: {
+                type: 'object',
+                required: ['handle', 'name'],
+                properties: {
+                  handle: {
+                    type: 'string',
+                    pattern: HANDLE_PATTERN.source
+                  },
+                  name: {
+                    type: 'string',
+                    minLength: 1,
+                    maxLength: 255
+                  }
+                }
+              }
+            },
+            threads: {
+              type: 'array',
+              maxItems: 200,
+              items: {
+                type: 'object',
+                required: ['content', 'createdAt'],
+                properties: {
+                  ...sampleCommentProperties,
+                  replies: {
+                    type: 'array',
+                    maxItems: 200,
+                    items: {
+                      type: 'object',
+                      required: ['content', 'createdAt'],
+                      properties: sampleCommentProperties
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'Sample comments written successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Comments written, replies included.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const { siteId, pageId, authors, threads } = req.body
+      if (!WIKI.sites[siteId]) {
+        return reply.badRequest('This site does not exist.')
+      }
+      if (!(await WIKI.models.comments.pageRef(siteId, pageId))) {
+        return reply.notFound('This page does not exist on this site.')
+      }
+      const handles = new Set(authors.map((author) => author.handle))
+      for (const comment of threads.flatMap((thread) => [thread, ...(thread.replies ?? [])])) {
+        if (comment.author ? !handles.has(comment.author) : !comment.guestName) {
+          return reply.badRequest(
+            comment.author
+              ? `"${comment.author}" is not one of the authors.`
+              : 'A comment needs either an author or a guest name.'
+          )
+        }
+      }
+
+      const accountIds = await WIKI.models.users.ensureSampleAccounts(authors)
+      const names = new Map(authors.map((author) => [author.handle, author.name]))
+      const toInput = (comment: SampleComment): DatedCommentInput => {
+        const createdAt = new Date(comment.createdAt)
+        return {
+          content: comment.content,
+          authorId: comment.author ? accountIds.get(comment.author)! : null,
+          authorName: comment.author ? names.get(comment.author)! : comment.guestName!,
+          // -> A guest's comment carries the address it was posted with; an account's carries none
+          authorEmail: comment.author ? '' : `guest@${SAMPLE_ACCOUNT_DOMAIN}`,
+          createdAt,
+          updatedAt: comment.editedAt ? new Date(comment.editedAt) : createdAt
+        }
+      }
+      const count = await WIKI.models.comments.insertThreads(
+        pageId,
+        threads.map((thread) => ({
+          ...toInput(thread),
+          replies: (thread.replies ?? []).map(toInput)
+        }))
+      )
+      await audit(req, 'admin', 'generateSampleComments', { siteId, pageId, count })
+
+      return {
+        ok: true,
+        message: `Wrote ${count} sample comment(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * PURGE EMPTY FOLDERS
+   *
+   * Housekeeping rather than a destruction: a folder is created for whatever is put in it and stays
+   * behind when that is deleted or moved away, so a wiki that has been reorganised a few times
+   * accumulates folders nobody can see anything in.
+   *
+   * Every site at once, deliberately. What is empty is a question about the tree and not about a
+   * particular site, and an administrator clearing up after a reorganisation would otherwise run this
+   * once per site.
+   */
+  app.post(
+    '/empty-folders/purge',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Delete every folder with no page or asset in it',
+        description:
+          'On every site and in every locale. A folder counts as empty when nothing sits below it at any depth, so a folder holding only empty folders goes as well, and with it the branch above it once its last folder is gone. Nothing that is not a folder is ever deleted — the emptiness check is part of the statement that does the deleting, so a page or an asset written while this runs keeps the folder it was put in.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Empty folders purged successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Folders deleted.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const count = await WIKI.models.tree.deleteEmptyFolders()
+      await audit(req, 'admin', 'purgeEmptyFolders', { count })
+
+      return {
+        ok: true,
+        message: `Deleted ${count} empty folder(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * REBUILD PAGE RATINGS
+   *
+   * The totals cached on every page, counted again from the ratings themselves.
+   *
+   * A page's cache is rewritten whenever one of its ratings is, so this is for the rows that changed
+   * without that happening — a deleted account's ratings going with it by cascade, most often. One
+   * statement per direction rather than a job: it is an aggregate over one table, not a read of every
+   * page's content.
+   */
+  app.post(
+    '/page-ratings/rebuild',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Recount the ratings cached on every page',
+        description:
+          'On every site. Rewrites the rating totals each page carries from the individual ratings recorded for it, and clears them on a page nobody has rated. Every page is locked for the length of the recount, so a rating given meanwhile waits for it rather than being left out.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Page ratings rebuilt successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              count: {
+                type: 'number',
+                description: 'Pages whose cached totals were wrong and have been corrected.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const count = await WIKI.models.pageRatings.rebuildAll()
+      await audit(req, 'admin', 'rebuildPageRatings', { count })
+
+      return {
+        ok: true,
+        message: `Corrected the ratings of ${count} page(s).`,
+        count
+      }
+    }
+  )
+
+  /**
+   * SCAN FOR PAGE PROBLEMS
+   *
+   * One batch of a read-only scan of every page on every site — see `models/pageProblems.ts` for the
+   * checks. The admin screen calls this until `cursor` comes back null, which is what gives it a
+   * progress bar and a way to stop without a job to cancel. A GET, and not audited: nothing is written.
+   */
+  app.get<{ Querystring: { cursor?: string } }>(
+    '/page-problems',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Scan pages for problems, one batch at a time',
+        description:
+          'Checks every page on every site for broken or out-of-step data: empty content or render, unreadable settings documents, unknown or disabled editors, broken redirections, tree entries that are missing, misplaced, stale or orphaned, path hashes and aliases, inactive locales, orphaned translation groups, publishing dates, the search index and sidebar menus. Nothing is changed.\n\nCall without a cursor to start; the first reply also says how many pages there are and how many rows the whole scan will read. Call again with the `cursor` each reply returns until it is null. `GET /system/page-problems/checks` lists what is checked.',
+        tags: ['System'],
+        querystring: {
+          type: 'object',
+          properties: {
+            cursor: {
+              type: 'string',
+              pattern: '^[pt]:([0-9a-f-]{36})?$',
+              description: 'Where the previous batch stopped. Omit to start a scan.'
+            }
+          }
+        },
+        response: {
+          200: {
+            description: 'One batch of the scan',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              pages: {
+                type: 'number',
+                description: 'Pages the scan checks, on every site. First batch only.'
+              },
+              total: {
+                type: 'number',
+                description:
+                  'Rows the whole scan reads — the pages, then every page entry in the file tree — which is what progress is measured against. First batch only.'
+              },
+              scanned: { type: 'number', description: 'Rows this batch read.' },
+              cursor: {
+                type: ['string', 'null'],
+                description: 'What to send for the next batch; null once the scan is complete.'
+              },
+              problems: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    check: { type: 'string' },
+                    severity: { type: 'string', enum: ['error', 'warning'] },
+                    pageId: { type: ['string', 'null'], format: 'uuid' },
+                    siteId: { type: 'string', format: 'uuid' },
+                    locale: { type: 'string' },
+                    path: { type: 'string' },
+                    title: { type: 'string' },
+                    url: {
+                      type: ['string', 'null'],
+                      description: 'Where to open the page; null for a tree entry with no page.'
+                    },
+                    params: {
+                      type: 'object',
+                      additionalProperties: { type: ['string', 'number'] },
+                      description: 'Details filled into the problem’s message.'
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const batch = await WIKI.models.pageProblems.scan(req.query.cursor)
+      return {
+        ok: true,
+        ...(req.query.cursor ? {} : await WIKI.models.pageProblems.size()),
+        ...batch
+      }
+    }
+  )
+
+  /**
+   * What the page problem scan checks, so the admin screen can list them before a scan has run —
+   * and so that the list, the severities and the grouping are the server's alone.
+   */
+  app.get(
+    '/page-problems/checks',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'List the checks the page problem scan runs',
+        tags: ['System'],
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              checks: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    key: { type: 'string' },
+                    group: { type: 'string' },
+                    severity: { type: 'string', enum: ['error', 'warning'] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async () => ({ ok: true, checks: PAGE_PROBLEM_CHECKS })
+  )
+
+  /**
+   * RERENDER ALL PAGES
+   *
+   * Every page rendered again from its source, by the admin's own browser rather than by Puppeteer —
+   * so it works on every instance, and it is the way to put right a wiki whose renders went blank or
+   * stale with no headless browser to fix them. The browser drives it: this starts a run and lists the
+   * pages, `sources` hands out their content a batch at a time, and each render comes back through the
+   * PUT below. Stopping is not asking again, as for the page problem scan.
+   *
+   * A POST, though it changes nothing, because it is where a run starts and so where the audit log
+   * records one. The renders themselves are not recorded one by one: a run is thousands of them, and
+   * a row each would bury everything else in the log under one button press.
+   */
+  app.post(
+    '/page-renders',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Start re-rendering every page from its source',
+        description:
+          'Lists every page on every site whose editor the frontend can render — markdown, visual and AsciiDoc — for the admin area to render one by one in the browser, which is what lets this work without the Puppeteer extension. Fetch the sources with `POST /system/page-renders/sources` and store each render with `PUT /system/page-renders/{pageId}`. Pages of other editors have no source to render and are only counted.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'The pages to render',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              skipped: {
+                type: 'number',
+                description: 'Pages left out because their editor cannot be rendered.'
+              },
+              pages: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    siteId: { type: 'string', format: 'uuid' },
+                    locale: { type: 'string' },
+                    path: { type: 'string' },
+                    title: { type: 'string' },
+                    editor: { type: 'string' }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => {
+      const { pages, skipped } = await WIKI.models.rendering.listForRerender()
+      await audit(req, 'admin', 'rerenderPages', { pages: pages.length })
+      return { ok: true, pages, skipped }
+    }
+  )
+
+  app.post<{ Body: { ids: string[] } }>(
+    '/page-renders/sources',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Fetch the sources of a batch of pages to re-render',
+        description:
+          'Each page comes with the site’s config for its editor, which is what to render it with, and a hash of its content to send back with the render. A page that has gone, or whose editor cannot be rendered, is left out of the reply.',
+        tags: ['System'],
+        body: {
+          type: 'object',
+          required: ['ids'],
+          properties: {
+            ids: {
+              type: 'array',
+              items: { type: 'string', format: 'uuid' },
+              maxItems: 50
+            }
+          }
+        },
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' },
+              pages: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', format: 'uuid' },
+                    siteId: { type: 'string', format: 'uuid' },
+                    path: { type: 'string' },
+                    editor: { type: 'string' },
+                    content: { type: 'string' },
+                    contentHash: { type: 'string' },
+                    config: { type: 'object', additionalProperties: true }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req) => ({
+      ok: true,
+      pages: await WIKI.models.rendering.sourcesForRerender(req.body.ids)
+    })
+  )
+
+  app.put<{ Params: { pageId: string }; Body: { render: string; contentHash: string } }>(
+    '/page-renders/:pageId',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Store a page render produced by the browser',
+        description:
+          'Sanitized like any render, against what the page’s current render shows it was allowed to carry — not against the caller’s permissions, so a re-render never brings back a script or a style that was stripped from the page when it was saved. Answers 409 when the page’s content has changed since its source was fetched, since the render would describe the content before that change.',
+        tags: ['System'],
+        params: {
+          type: 'object',
+          required: ['pageId'],
+          properties: {
+            pageId: { type: 'string', format: 'uuid' }
+          }
+        },
+        body: {
+          type: 'object',
+          required: ['render', 'contentHash'],
+          properties: {
+            render: { type: 'string' },
+            contentHash: { type: 'string' }
+          }
+        },
+        response: {
+          200: {
+            description: 'Render stored',
+            type: 'object',
+            properties: {
+              ok: { type: 'boolean' }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const outcome = await WIKI.models.rendering.storeRerender(
+        req.params.pageId,
+        req.body.render,
+        req.body.contentHash
+      )
+      switch (outcome) {
+        case 'missing':
+          return reply.notFound('This page no longer exists.')
+        case 'changed':
+          return reply.conflict('The page was changed while it was being rendered.')
+        case 'unsupported':
+          return reply.badRequest('Pages of this editor cannot be rendered.')
+      }
+      return { ok: true }
+    }
+  )
+
+  /**
+   * REBUILD PAGE LINKS
+   *
+   * What every page points at, worked out again from the render each one already stores.
+   *
+   * Not a repair anybody should need after an ordinary edit: a page's links are rewritten every time
+   * its render is. It is for the two cases where there was nothing to derive them from at the time —
+   * content that predates the table, and a site whose locale prefixes or page extensions changed,
+   * which changes what a link already written in a page addresses without touching the page.
+   */
+  app.post(
+    '/page-links/rebuild',
+    {
+      config: {
+        permissions: ['manage:system']
+      },
+      schema: {
+        summary: 'Rebuild the page link index',
+        description:
+          'Queues a job that re-reads the stored render of every page on every site and records what each one links to. Runs in a worker thread because it touches all the content in the instance, so the response only says the job was queued.',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Rebuild queued successfully',
+            type: 'object',
+            properties: {
+              ok: {
+                type: 'boolean'
+              },
+              message: {
+                type: 'string'
+              },
+              id: {
+                type: 'string',
+                format: 'uuid',
+                description: 'ID of the queued job, which the scheduler view lists.'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      const added = await WIKI.scheduler.addJob({ task: 'rebuildPageLinks' })
+      if (!added?.id) {
+        return reply.internalServerError('The scheduler could not queue the rebuild.')
+      }
+
+      await audit(req, 'admin', 'rebuildPageLinks', { jobId: added.id })
+
+      return {
+        ok: true,
+        message: 'Page link rebuild queued successfully.',
+        id: added.id
+      }
+    }
+  )
+
+  /**
+   * CHECK FOR UPDATE
+   */
+  app.post(
+    '/checkForUpdate',
+    {
+      config: {
+        permissions: ['access:admin']
+      },
+      schema: {
+        summary: 'Check for Updates',
+        tags: ['System'],
+        response: {
+          200: {
+            description: 'Update Info',
+            type: 'object',
+            properties: {
+              current: {
+                type: 'string'
+              },
+              latest: {
+                type: 'string'
+              },
+              latestDate: {
+                type: 'string',
+                format: 'date-time'
+              }
+            }
+          }
+        }
+      }
+    },
+    async (req, reply) => {
+      // -> The task skips itself offline, which here would answer with whatever was stored last
+      if (WIKI.config.offline) {
+        return reply.badRequest('Wiki.js is in offline mode and cannot check for updates.')
+      }
+
+      const renderJob = await WIKI.scheduler.addJob({
+        task: 'checkVersion',
+        maxRetries: 0,
+        promise: true
+      })
+      // NOTE: `addJob` resolves to undefined if enqueueing failed, in which case this throws —
+      // preserving the existing behavior.
+      await renderJob!.promise
+
+      await audit(req, 'admin', 'checkForUpdate', { latest: WIKI.config.update.version })
+
+      return {
+        current: WIKI.version,
+        latest: WIKI.config.update.version,
+        latestDate: WIKI.config.update.versionDate
+      }
+    }
+  )
+}
+
+export default routes
